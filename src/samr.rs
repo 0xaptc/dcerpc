@@ -6,8 +6,8 @@
 use crate::ndr::{NdrDecoder, NdrEncoder};
 use crate::transport::SmbPipe;
 use crate::{Result, RpcError, Syntax};
-use windows_sddl::sid::Sid;
 use smb2_client::SmbClient;
+use windows_sddl::sid::Sid;
 
 /// The SAMR interface (v1.0).
 pub fn samr_syntax() -> Syntax {

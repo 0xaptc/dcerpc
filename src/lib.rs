@@ -10,6 +10,7 @@
 //! Interface UUIDs are parsed from their canonical strings via `windows_sddl::sid::Guid`,
 //! whose byte layout already matches the DCE UUID on-wire encoding.
 
+pub mod dcom;
 pub mod drsuapi;
 pub mod efsr;
 pub mod epm;

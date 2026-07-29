@@ -22,5 +22,8 @@ md-5 = "0.10"
 des = "0.8"
 hex = "0.4"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros"] }
+
 [badges]
 maintenance = { status = "actively-developed" }

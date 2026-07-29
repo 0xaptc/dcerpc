@@ -6,8 +6,8 @@ use crate::ndr::{NdrDecoder, NdrEncoder};
 use crate::samr::SamrHandle; // 20-byte RPC context handle, reused
 use crate::transport::SmbPipe;
 use crate::{Result, Syntax};
-use windows_sddl::sid::Sid;
 use smb2_client::SmbClient;
+use windows_sddl::sid::Sid;
 
 /// The LSARPC interface (v0.0). Note the UUID differs from SAMR only in the last nibble.
 pub fn lsat_syntax() -> Syntax {

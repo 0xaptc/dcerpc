@@ -1,0 +1,311 @@
+//! MS-RRP — the Windows Remote Registry protocol over `\PIPE\winreg`. Read remote registry
+//! values, which is what several AD CS ESC detections need but LDAP can't see:
+//!
+//! - **ESC6**  — CA `EditFlags` & `EDITF_ATTRIBUTESUBJECTALTNAME2` (0x00040000)
+//! - **ESC11** — CA `InterfaceFlags` & `IF_ENFORCEENCRYPTICERTREQUEST` (0x00000200) *not* set
+//! - **ESC16** — CA `DisableExtensionList` contains the szOID_NTDS_CA_SECURITY_EXT
+//! - **ESC7**  — CA `Security` (a SECURITY_DESCRIPTOR; ManageCA/ManageCertificates ACEs)
+//! - **ESC10** — DC `Kdc\StrongCertificateBindingEnforcement` / Schannel `CertificateMappingMethods`
+//!
+//! Requires the target's Remote Registry service to be reachable on the `\winreg` pipe. Rides the
+//! same authenticated SMB transport as the SAMR/SVCCTL clients.
+//!
+//! Status: client + marshaling; `BaseRegQueryValue`'s size dance is validated live against a lab
+//! (needs Remote Registry running).
+
+use crate::ndr::{NdrDecoder, NdrEncoder};
+use crate::transport::SmbPipe;
+use crate::{Result, RpcError, Syntax};
+use smb2_client::SmbClient;
+
+/// The Windows Remote Registry interface (winreg, v1.0).
+pub fn winreg_syntax() -> Syntax {
+    Syntax::new("338cd001-2244-31f1-aaaa-900038001003", 1, 0)
+}
+
+pub mod opnum {
+    pub const OPEN_LOCAL_MACHINE: u16 = 2; // OpenHKLM
+    pub const BASE_REG_CLOSE_KEY: u16 = 5;
+    pub const BASE_REG_OPEN_KEY: u16 = 15;
+    pub const BASE_REG_QUERY_VALUE: u16 = 17;
+}
+
+/// REGSAM for read-only value access (STANDARD_RIGHTS_READ | KEY_QUERY_VALUE | ENUM | NOTIFY).
+const KEY_READ: u32 = 0x0002_0019;
+/// Read buffer handed to BaseRegQueryValue (CA `Security` SDs are the largest values we read).
+const QUERY_BUF: u32 = 0x0002_0000; // 128 KiB
+
+/// A 20-byte RPC_HKEY policy handle (attributes u32 + 16-byte context uuid).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Hkey(pub [u8; 20]);
+
+impl Hkey {
+    fn decode(d: &mut NdrDecoder) -> Result<Self> {
+        let attrs = d.u32()?;
+        let uuid = d.uuid()?;
+        let mut h = [0u8; 20];
+        h[..4].copy_from_slice(&attrs.to_le_bytes());
+        h[4..].copy_from_slice(&uuid);
+        Ok(Hkey(h))
+    }
+    fn encode(&self, e: &mut NdrEncoder) {
+        e.bytes(&self.0);
+    }
+    fn is_null(&self) -> bool {
+        self.0 == [0u8; 20]
+    }
+}
+
+/// A registry value's type + raw data.
+#[derive(Clone, Debug)]
+pub struct RegValue {
+    pub ty: u32, // REG_DWORD=4, REG_BINARY=3, REG_SZ=1, REG_MULTI_SZ=7, …
+    pub data: Vec<u8>,
+}
+
+impl RegValue {
+    /// Interpret a REG_DWORD (little-endian) — the common case for CA/DC flag values.
+    pub fn as_dword(&self) -> Option<u32> {
+        self.data
+            .get(0..4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    }
+    /// Interpret REG_SZ / REG_MULTI_SZ as UTF-16LE text (NULs → newlines for MULTI_SZ).
+    pub fn as_string(&self) -> String {
+        let units: Vec<u16> = self
+            .data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+            .replace('\0', "\n")
+            .trim()
+            .to_string()
+    }
+}
+
+/// Encode an `RRP_UNICODE_STRING` (RPC_UNICODE_STRING): Length + MaximumLength (bytes, NUL
+/// included) + a non-null Buffer referent, then the deferred conformant-varying wchar array.
+fn encode_ustr(e: &mut NdrEncoder, s: &str) {
+    let mut units: Vec<u16> = s.encode_utf16().collect();
+    units.push(0); // trailing NUL — RRP counts it in Length
+    let n = units.len() as u32;
+    let bytes = (n * 2) as u16;
+    e.u16(bytes); // Length
+    e.u16(bytes); // MaximumLength
+    e.referent(); // Buffer (non-null)
+    e.u32(n); // max_count
+    e.u32(0); // offset
+    e.u32(n); // actual_count
+    for u in units {
+        e.u16(u);
+    }
+    e.align(4);
+}
+
+fn encode_open_local_machine() -> Vec<u8> {
+    let mut e = NdrEncoder::new();
+    e.null_ptr(); // ServerName [in, unique] → NULL (this host)
+    e.u32(KEY_READ); // samDesired
+    e.into_bytes()
+}
+
+fn encode_open_key(hkey: &Hkey, subkey: &str) -> Vec<u8> {
+    let mut e = NdrEncoder::new();
+    hkey.encode(&mut e);
+    encode_ustr(&mut e, subkey);
+    e.u32(0); // dwOptions (REG_OPTION_NON_VOLATILE)
+    e.u32(KEY_READ); // samDesired
+    e.into_bytes()
+}
+
+fn encode_query_value(hkey: &Hkey, value: &str) -> Vec<u8> {
+    let mut e = NdrEncoder::new();
+    hkey.encode(&mut e);
+    encode_ustr(&mut e, value);
+    // lpType [in,out,unique] → referent + DWORD(0)
+    e.referent();
+    e.u32(0);
+    // lpData [in,out,unique,size_is(*lpcbData)] → referent + conformant/varying header, no bytes in
+    e.referent();
+    e.u32(QUERY_BUF); // max_count (conformance = buffer we offer)
+    e.u32(0); // offset
+    e.u32(0); // actual_count (in-value: empty)
+    // lpcbData [in,out,unique] → referent + DWORD(buffer size)
+    e.referent();
+    e.u32(QUERY_BUF);
+    // lpcbLen [in,out,unique] → referent + DWORD(0)
+    e.referent();
+    e.u32(0);
+    e.into_bytes()
+}
+
+fn encode_close(hkey: &Hkey) -> Vec<u8> {
+    let mut e = NdrEncoder::new();
+    hkey.encode(&mut e);
+    e.into_bytes()
+}
+
+/// Parse the BaseRegQueryValue reply: [out] lpType, lpData (conformant-varying byte array),
+/// lpcbData, lpcbLen, then the Win32 return. Returns the value's type + bytes.
+fn decode_query_value(stub: &[u8]) -> Result<RegValue> {
+    let mut d = NdrDecoder::new(stub);
+    // lpType (unique)
+    let mut ty = 0u32;
+    if d.u32()? != 0 {
+        ty = d.u32()?;
+    }
+    // lpData (unique) → conformant-varying byte array
+    let mut data = Vec::new();
+    if d.u32()? != 0 {
+        let _max = d.u32()?;
+        let _off = d.u32()?;
+        let actual = d.u32()? as usize;
+        data = d.read_bytes(actual)?.to_vec();
+        d.align(4);
+    }
+    Ok(RegValue { ty, data })
+}
+
+/// High-level RRP client bound over an SMB `\PIPE\winreg`.
+pub struct RegistryClient<'a> {
+    pipe: SmbPipe<'a>,
+}
+
+impl<'a> RegistryClient<'a> {
+    /// Open `\winreg` on an already-authenticated SMB session and bind winreg (sign+seal).
+    pub async fn connect(
+        client: &'a mut SmbClient,
+        domain: &str,
+        user: &str,
+        password: &str,
+        host: &str,
+    ) -> Result<RegistryClient<'a>> {
+        let file_id = client
+            .open_pipe("winreg")
+            .await
+            .map_err(|e| RpcError::Protocol(format!("open \\winreg: {e}")))?;
+        let mut pipe = SmbPipe::new(client, file_id);
+        pipe.bind_sealed(winreg_syntax(), domain, user, password, host)
+            .await?;
+        Ok(RegistryClient { pipe })
+    }
+
+    async fn open_hklm(&mut self) -> Result<Hkey> {
+        let resp = self
+            .pipe
+            .call_sealed(opnum::OPEN_LOCAL_MACHINE, &encode_open_local_machine())
+            .await?;
+        let mut d = NdrDecoder::new(&resp);
+        let h = Hkey::decode(&mut d)?;
+        let ret = d.u32().unwrap_or(u32::MAX);
+        if ret != 0 || h.is_null() {
+            return Err(RpcError::Protocol(format!("OpenLocalMachine failed ({ret})")));
+        }
+        Ok(h)
+    }
+
+    async fn open_key(&mut self, parent: &Hkey, subkey: &str) -> Result<Hkey> {
+        let resp = self
+            .pipe
+            .call_sealed(opnum::BASE_REG_OPEN_KEY, &encode_open_key(parent, subkey))
+            .await?;
+        let mut d = NdrDecoder::new(&resp);
+        let h = Hkey::decode(&mut d)?;
+        let ret = d.u32().unwrap_or(u32::MAX);
+        if ret != 0 || h.is_null() {
+            return Err(RpcError::Protocol(format!(
+                "BaseRegOpenKey('{subkey}') failed ({ret})"
+            )));
+        }
+        Ok(h)
+    }
+
+    async fn query_value(&mut self, key: &Hkey, value: &str) -> Result<RegValue> {
+        let resp = self
+            .pipe
+            .call_sealed(opnum::BASE_REG_QUERY_VALUE, &encode_query_value(key, value))
+            .await?;
+        decode_query_value(&resp)
+    }
+
+    async fn close(&mut self, key: &Hkey) {
+        let _ = self
+            .pipe
+            .call_sealed(opnum::BASE_REG_CLOSE_KEY, &encode_close(key))
+            .await;
+    }
+
+    /// Open `HKLM\<subkey>`, read `<value>`, close — the one-shot most ESC checks need.
+    pub async fn read_value(&mut self, subkey: &str, value: &str) -> Result<RegValue> {
+        let hklm = self.open_hklm().await?;
+        let key = self.open_key(&hklm, subkey).await;
+        let key = match key {
+            Ok(k) => k,
+            Err(e) => {
+                self.close(&hklm).await;
+                return Err(e);
+            }
+        };
+        let v = self.query_value(&key, value).await;
+        self.close(&key).await;
+        self.close(&hklm).await;
+        v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn le16(b: &[u8], o: usize) -> u16 {
+        u16::from_le_bytes([b[o], b[o + 1]])
+    }
+    fn le32(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn ustr_counts_include_nul() {
+        let mut e = NdrEncoder::new();
+        encode_ustr(&mut e, "AB");
+        let b = e.into_bytes();
+        // Length/MaximumLength = (2 chars + NUL) * 2 = 6 bytes.
+        assert_eq!(le16(&b, 0), 6);
+        assert_eq!(le16(&b, 2), 6);
+        assert_ne!(le32(&b, 4), 0); // Buffer referent non-null
+        assert_eq!(le32(&b, 8), 3, "max_count = 3 (A B NUL)");
+        assert_eq!(le32(&b, 12), 0, "offset");
+        assert_eq!(le32(&b, 16), 3, "actual_count");
+        assert_eq!(le16(&b, 20), b'A' as u16);
+    }
+
+    #[test]
+    fn open_local_machine_stub() {
+        let b = encode_open_local_machine();
+        assert_eq!(le32(&b, 0), 0, "ServerName NULL");
+        assert_eq!(le32(&b, 4), KEY_READ);
+    }
+
+    #[test]
+    fn query_value_roundtrip_decodes_dword() {
+        // Build a synthetic reply: lpType(REG_DWORD) + lpData(4-byte 0x00040000) + sizes + ret 0.
+        let mut e = NdrEncoder::new();
+        e.referent();
+        e.u32(4); // REG_DWORD
+        e.referent();
+        e.u32(4); // max_count
+        e.u32(0); // offset
+        e.u32(4); // actual_count
+        e.bytes(&0x0004_0000u32.to_le_bytes());
+        e.align(4);
+        e.referent();
+        e.u32(4); // lpcbData
+        e.referent();
+        e.u32(4); // lpcbLen
+        e.u32(0); // return
+        let v = decode_query_value(&e.into_bytes()).unwrap();
+        assert_eq!(v.ty, 4);
+        assert_eq!(v.as_dword(), Some(0x0004_0000));
+    }
+}

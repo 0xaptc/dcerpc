@@ -19,6 +19,7 @@ pub mod lsat;
 pub mod ndr;
 pub mod pdu;
 pub mod rprn;
+pub mod rrp;
 pub mod samr;
 pub mod svcctl;
 pub mod transport;

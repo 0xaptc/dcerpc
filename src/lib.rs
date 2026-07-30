@@ -11,6 +11,7 @@
 //! whose byte layout already matches the DCE UUID on-wire encoding.
 
 pub mod dcom;
+pub mod dcom_wmi;
 pub mod drsuapi;
 pub mod efsr;
 pub mod epm;

@@ -18,6 +18,7 @@ pub mod epm;
 pub mod icpr;
 pub mod lsat;
 pub mod ndr;
+pub mod netlogon;
 pub mod pdu;
 pub mod rprn;
 pub mod rrp;

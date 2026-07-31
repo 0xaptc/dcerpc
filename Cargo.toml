@@ -21,6 +21,9 @@ tracing = "0.1"
 md-5 = "0.10"
 des = "0.8"
 hex = "0.4"
+aes = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "time", "rt", "macros"] }

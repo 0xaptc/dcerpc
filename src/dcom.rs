@@ -37,7 +37,7 @@ pub fn orpc_this(cid: &[u8; 16]) -> Vec<u8> {
     let mut e = NdrEncoder::new();
     e.u16(COMVERSION_MAJOR);
     e.u16(COMVERSION_MINOR);
-    e.u32(0); // flags
+    e.u32(1); // flags (ORPCF — impacket sets 1 on activation ORPCTHIS)
     e.u32(0); // reserved1
     e.uuid(cid); // CID (causality id)
     e.null_ptr(); // ORPC_EXTENT_ARRAY* extensions (none)
@@ -91,7 +91,7 @@ mod tests {
         assert_eq!(b.len(), 32, "ORPCTHIS is 32 bytes");
         assert_eq!(&b[0..2], &5u16.to_le_bytes()); // COMVERSION major
         assert_eq!(&b[2..4], &7u16.to_le_bytes()); // COMVERSION minor
-        assert_eq!(&b[4..8], &[0, 0, 0, 0]); // flags
+        assert_eq!(&b[4..8], &[1, 0, 0, 0]); // flags
         assert_eq!(&b[8..12], &[0, 0, 0, 0]); // reserved
         assert_eq!(&b[12..28], &cid); // causality id
         assert_eq!(&b[28..32], &[0, 0, 0, 0]); // null extensions ptr

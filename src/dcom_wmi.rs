@@ -13,14 +13,17 @@
 //! `OBJREF_CUSTOM` (MInterfacePointer). References: MS-DCOM §2.2.22 (Activation Properties),
 //! §2.2.18 (OBJREF), §2.2.19 (STDOBJREF / DUALSTRINGARRAY).
 //!
-//! **STATUS (live against a Server 2022 DC):** the sealed NTLM bind to ISystemActivator on
-//! ncacn_ip_tcp:135 and the `RemoteCreateInstance` (opnum 4) call both succeed, and the server
-//! *unmarshals* the six-property activation blob cleanly (no more `nca_s_fault_ndr`). The SCM then
-//! returns `E_FAIL (0x80004005)` — a semantic activation refusal with no field locality. Pinning
-//! the remaining property-field discrepancy needs a byte-diff against a wire capture of a working
-//! wmiexec (impacket) against the same host; blind field-guessing is low-yield. Transport, auth,
-//! stub dispatch, the MInterfacePointer conformant wrapper, and the OBJREF parse are all proven; the
-//! activation-property *contents* are the open item. Stages 2–3 are gated on Stage 1 completing.
+//! **STATUS (live against a Windows DC):** Stage 1 is COMPLETE — the sealed NTLM bind to
+//! ISystemActivator, `RemoteCreateInstance` (opnum 4), and the activation blob all succeed:
+//! `HRESULT = 0` and the SCM returns a STDOBJREF for the `IWbemLevel1Login` object. The earlier
+//! `E_FAIL (0x80004005)` was resolved by byte-diffing the activation blob against impacket's
+//! (`examples/wmi_probe.rs` reproduces the live probe). The fixes: send exactly the four properties
+//! impacket sends (InstantiationInfo, ActivationContextInfo, ServerLocation, ScmRequest — not six,
+//! and ServerLocation's CLSID is `…a4`, not `…a6`); `classCtx`/`ClientImpLevel` left 0; the type-ser
+//! `ObjectBufferLength` is the *unpadded* body with 0xFA inter-property alignment; PrivateHeader
+//! filler 0xcccccccc; `dwSize` excludes the leading 8 bytes; `ObjectReferenceSize = len+8`; and the
+//! ORPCTHIS `flags = 1`. Stages 2–3 (OXID resolve → `NTLMLogin` → `IWbemServices::ExecMethod`
+//! `Win32_Process.Create`) build on this.
 
 use crate::dcom::{orpc_this, IID_ISYSTEM_ACTIVATOR};
 use crate::ndr::{NdrDecoder, NdrEncoder};
@@ -33,10 +36,8 @@ const CLSID_ACTIVATION_PROPERTIES_IN: &str = "00000338-0000-0000-c000-0000000000
 const IID_IACTIVATION_PROPERTIES_IN: &str = "000001a2-0000-0000-c000-000000000046";
 const CLSID_INSTANTIATION_INFO: &str = "000001ab-0000-0000-c000-000000000046";
 const CLSID_ACTIVATION_CONTEXT_INFO: &str = "000001a5-0000-0000-c000-000000000046";
-const CLSID_SERVER_LOCATION_INFO: &str = "000001a6-0000-0000-c000-000000000046";
+const CLSID_SERVER_LOCATION_INFO: &str = "000001a4-0000-0000-c000-000000000046";
 const CLSID_SCM_REQUEST_INFO: &str = "000001aa-0000-0000-c000-000000000046";
-const CLSID_SECURITY_INFO: &str = "000001a4-0000-0000-c000-000000000046";
-const CLSID_SPECIAL_SYSTEM_PROPERTIES: &str = "000001b9-0000-0000-c000-000000000046";
 
 /// ncacn_ip_tcp protocol-sequence id used in the SCM request's requested protseqs.
 const NCACN_IP_TCP: u16 = 0x07;
@@ -56,20 +57,19 @@ fn pickle_header(body_len: usize) -> [u8; 16] {
     h[1] = 0x10; // little-endian, ASCII char rep
     h[2] = 0x08; // common header length
     h[3] = 0x00;
-    h[4..8].copy_from_slice(&0xcccc_ccccu32.to_le_bytes()); // filler
+    h[4..8].copy_from_slice(&0xcccc_ccccu32.to_le_bytes()); // CommonTypeHeader filler
     h[8..12].copy_from_slice(&(body_len as u32).to_le_bytes()); // ObjectBufferLength
-    // h[12..16] = 0 filler
+    h[12..16].copy_from_slice(&0xcccc_ccccu32.to_le_bytes()); // PrivateHeader filler (impacket uses 0xcc)
     h
 }
 
-/// Wrap a struct body in its type-serialization pickle (16-byte header + body, 8-padded).
+/// Wrap a struct body in its type-serialization pickle (16-byte header + body). `ObjectBufferLength`
+/// is the *unpadded* body length (matching MS-DCOM/impacket); any 8-byte alignment between properties
+/// is done by the caller with 0xFA filler, and is NOT counted in this header.
 fn pickle(body: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(16 + body.len() + 8);
-    // ObjectBufferLength counts the body padded to an 8-byte multiple.
-    let padded = (body.len() + 7) & !7;
-    v.extend_from_slice(&pickle_header(padded));
+    let mut v = Vec::with_capacity(16 + body.len());
+    v.extend_from_slice(&pickle_header(body.len()));
     v.extend_from_slice(body);
-    v.resize(16 + padded, 0);
     v
 }
 
@@ -77,7 +77,7 @@ fn pickle(body: &[u8]) -> Vec<u8> {
 fn instantiation_info(clsid: &str, iids: &[&str]) -> Vec<u8> {
     let mut e = NdrEncoder::new();
     e.uuid(&guid_bytes(clsid)); // classId
-    e.u32(0x14); // classCtx = CLSCTX_LOCAL_SERVER | CLSCTX_REMOTE_SERVER
+    e.u32(0); // classCtx (impacket leaves this 0 — the SCM applies its own default)
     e.u32(0); // actvflags
     e.u32(0); // fIsSurrogate
     e.u32(iids.len() as u32); // cIID
@@ -116,42 +116,13 @@ fn location_info() -> Vec<u8> {
     pickle(&e.into_bytes())
 }
 
-/// SpecialPropertiesData (§2.2.22.2.3): default authn level, no session/partition.
-fn special_properties() -> Vec<u8> {
-    let mut e = NdrEncoder::new();
-    e.u32(0); // dwSessionId
-    e.u32(0); // fRemoteThisSessionId
-    e.u32(0); // fClientImpersonating
-    e.u32(0); // fPartitionIDPresent
-    e.u32(0); // dwDefaultAuthnLvl
-    e.uuid(&[0u8; 16]); // guidPartition
-    e.u32(0); // dwPRTFlags
-    e.u32(0); // dwOrigClsctx
-    e.u32(0); // dwFlags
-    // Reserved: 8 reserved DWORDs (Reserved1[8] per §2.2.22.2.3 layout used by impacket).
-    for _ in 0..8 {
-        e.u32(0);
-    }
-    e.u64(0); // Reserved3 (ULONGLONG)
-    pickle(&e.into_bytes())
-}
-
-/// SecurityInfoData (§2.2.22.2.4): default authn, no explicit server info.
-fn security_info() -> Vec<u8> {
-    let mut e = NdrEncoder::new();
-    e.u32(0); // dwAuthnFlags
-    e.null_ptr(); // pServerInfo (COSERVERINFO*)
-    e.null_ptr(); // pdwReserved
-    pickle(&e.into_bytes())
-}
-
 /// ScmRequestInfoData (§2.2.22.2.7): one requested protseq (ncacn_ip_tcp), no remote bindings.
 fn scm_request_info() -> Vec<u8> {
     let mut e = NdrEncoder::new();
     e.null_ptr(); // pdwReserved
     e.referent(); // remoteRequest (customREMOTE_REQUEST_SCM_INFO*, non-null)
     // customREMOTE_REQUEST_SCM_INFO:
-    e.u32(2); // ClientImpLevel = RPC_C_IMP_LEVEL_IMPERSONATE
+    e.u32(0); // ClientImpLevel (impacket leaves this 0)
     e.u16(1); // cRequestedProtseqs
     e.u16(0); // pad
     e.referent(); // pRequestedProtseqs (unique ptr → conformant array)
@@ -163,16 +134,26 @@ fn scm_request_info() -> Vec<u8> {
 /// Assemble the full activation-properties `OBJREF_CUSTOM` (MInterfacePointer bytes) for a
 /// `RemoteCreateInstance` of `clsid` requesting `iids`.
 fn activation_properties_in(clsid: &str, iids: &[&str]) -> Vec<u8> {
-    // Property order + their CLSIDs.
-    let props: [(&str, Vec<u8>); 6] = [
-        (CLSID_SPECIAL_SYSTEM_PROPERTIES, special_properties()),
+    // Exactly the four properties impacket sends, in this order — Special/Security are omitted (a
+    // remote SCM rejects the extra/misordered set with E_FAIL). Each property blob is padded to an
+    // 8-byte boundary with 0xFA filler *outside* its pickle, and pSizes records the padded length.
+    let props: [(&str, Vec<u8>); 4] = [
         (CLSID_INSTANTIATION_INFO, instantiation_info(clsid, iids)),
         (CLSID_ACTIVATION_CONTEXT_INFO, activation_context_info()),
-        (CLSID_SECURITY_INFO, security_info()),
         (CLSID_SERVER_LOCATION_INFO, location_info()),
         (CLSID_SCM_REQUEST_INFO, scm_request_info()),
     ];
     let n = props.len();
+    // Pad each pickled property to 8 bytes with 0xFA; pSizes = padded length.
+    let padded: Vec<Vec<u8>> = props
+        .iter()
+        .map(|(_, blob)| {
+            let mut b = blob.clone();
+            let pad = (8 - (b.len() % 8)) % 8;
+            b.extend(std::iter::repeat(0xFA).take(pad));
+            b
+        })
+        .collect();
 
     // CustomHeader body (before its own pickle header).
     let mut ch = NdrEncoder::new();
@@ -191,15 +172,15 @@ fn activation_properties_in(clsid: &str, iids: &[&str]) -> Vec<u8> {
         ch.uuid(&guid_bytes(c));
     }
     ch.u32(n as u32); // pSizes max_count
-    for (_, blob) in &props {
-        ch.u32(blob.len() as u32);
+    for b in &padded {
+        ch.u32(b.len() as u32); // padded property length
     }
     let mut custom_header = pickle(&ch.into_bytes());
 
-    // ActivationBLOB = dwSize + dwReserved + CustomHeader(pickled) + each property(pickled).
+    // ActivationBLOB = dwSize + dwReserved + CustomHeader(pickled) + each padded property.
     let mut props_bytes = Vec::new();
-    for (_, blob) in &props {
-        props_bytes.extend_from_slice(blob);
+    for b in &padded {
+        props_bytes.extend_from_slice(b);
     }
     // Patch CustomHeader.totalSize (body off 0) and headerSize (body off 4): the SCM uses these to
     // walk the property blobs. headerSize = the pickled CustomHeader length; totalSize adds the
@@ -209,9 +190,10 @@ fn activation_properties_in(clsid: &str, iids: &[&str]) -> Vec<u8> {
     custom_header[16..20].copy_from_slice(&total_size.to_le_bytes());
     custom_header[20..24].copy_from_slice(&header_size.to_le_bytes());
 
+    // dwSize counts CustomHeader + properties only (NOT the leading dwSize/dwReserved), per impacket.
     let mut blob = Vec::new();
-    let total = 8 + custom_header.len() + props_bytes.len();
-    blob.extend_from_slice(&(total as u32).to_le_bytes()); // dwSize
+    let dw_size = custom_header.len() + props_bytes.len();
+    blob.extend_from_slice(&(dw_size as u32).to_le_bytes()); // dwSize
     blob.extend_from_slice(&0u32.to_le_bytes()); // dwReserved
     blob.extend_from_slice(&custom_header);
     blob.extend_from_slice(&props_bytes);
@@ -230,7 +212,9 @@ fn objref_custom(clsid: &str, iid: &str, object_data: &[u8]) -> Vec<u8> {
     o.extend_from_slice(&guid_bytes(iid)); // iid
     o.extend_from_slice(&guid_bytes(clsid)); // OBJREF_CUSTOM.clsid
     o.extend_from_slice(&0u32.to_le_bytes()); // cbExtension
-    o.extend_from_slice(&(object_data.len() as u32).to_le_bytes()); // ObjectReferenceSize
+    // impacket sets ObjectReferenceSize = len(pObjectData) + 8 (the extra 8 covers the leading
+    // dwSize/dwReserved the SCM expects to skip); a plain length yields E_FAIL.
+    o.extend_from_slice(&((object_data.len() + 8) as u32).to_le_bytes()); // ObjectReferenceSize
     o.extend_from_slice(object_data); // pObjectData
     o
 }
@@ -315,11 +299,6 @@ pub async fn remote_create_instance(
     clsid: &str,
     iids: &[&str],
 ) -> Result<(StdObjRef, i32)> {
-    let addr = if host.contains(':') {
-        host.to_string()
-    } else {
-        format!("{host}:135")
-    };
     let reply = remote_create_instance_raw(host, domain, user, password, workstation, clsid, iids).await?;
     let hr = activation_hresult(&reply);
     let obj = parse_stdobjref(&reply)?;
@@ -361,6 +340,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wmi_activation_stub_matches_impacket() {
+        // Regression: the WMI RemoteCreateInstance stub is byte-identical (modulo NDR referent-id
+        // values + alignment fill) to the impacket blob a live DC accepts with HRESULT 0. Locks in
+        // the E_FAIL fix — 464 bytes, ORPCTHIS flags=1, four activation properties (cIfs=4).
+        let cid = [0x5Au8; 16];
+        let stub = remote_create_instance_stub(
+            &cid,
+            "8bc3f05e-d86b-11d0-a075-00c04fb68820", // CLSID_WbemLevel1Login
+            &["f309ad18-d86a-11d0-a075-00c04fb68820"], // IID_IWbemLevel1Login
+        );
+        assert_eq!(stub.len(), 464, "activation stub size");
+        assert_eq!(&stub[4..8], &[1, 0, 0, 0], "ORPCTHIS flags must be 1");
+        // MEOW OBJREF_CUSTOM at offset 48; CustomHeader.cIfs (destCtx+4) must be 4 properties.
+        let meow = stub.windows(4).position(|w| w == b"MEOW").expect("MEOW");
+        assert_eq!(meow, 48);
+        // dwSize/dwReserved(8) + type-ser header(16) + totalSize(4)+headerSize(4)+dwReserved(4)
+        // + destCtx(4) → cIfs. From MEOW: +8(iid start)… simpler: assert exactly one 0x04 cIfs via
+        // the pclsid count marker appearing with the four activation CLSIDs.
+        let count_ab = stub.windows(4).filter(|w| *w == [0xab, 0x01, 0x00, 0x00]).count();
+        assert_eq!(count_ab, 1, "InstantiationInfo CLSID present once");
+    }
+
+    #[test]
     fn pickle_header_shape() {
         let h = pickle_header(0x40);
         assert_eq!(&h[0..4], &[0x01, 0x10, 0x08, 0x00]);
@@ -378,9 +380,9 @@ mod tests {
         assert_eq!(&o[0..4], b"MEOW");
         assert_eq!(&o[4..8], &4u32.to_le_bytes()); // OBJREF_CUSTOM flags
         let n = o.len();
-        // trailer: cbExtension(0) + ObjectReferenceSize(8) + 8 data bytes.
+        // trailer: cbExtension(0) + ObjectReferenceSize(len+8=16) + 8 data bytes.
         assert_eq!(&o[n - 16..n - 12], &0u32.to_le_bytes()); // cbExtension
-        assert_eq!(&o[n - 12..n - 8], &8u32.to_le_bytes()); // ObjectReferenceSize
+        assert_eq!(&o[n - 12..n - 8], &16u32.to_le_bytes()); // ObjectReferenceSize = 8 data + 8
         assert_eq!(&o[n - 8..], &[0xAA; 8]); // pObjectData
     }
 

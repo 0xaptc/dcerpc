@@ -289,6 +289,22 @@ pub fn activation_hresult(reply: &[u8]) -> i32 {
         .unwrap_or(-1)
 }
 
+/// Sealed bind for the DCOM path, password or pass-the-hash (`nt_hash` takes precedence).
+async fn bind_wmi(
+    rpc: &mut RpcTcp,
+    syntax: Syntax,
+    domain: &str,
+    user: &str,
+    password: &str,
+    nt_hash: Option<&[u8; 16]>,
+    workstation: &str,
+) -> Result<()> {
+    match nt_hash {
+        Some(h) => rpc.bind_sealed_hash(syntax, domain, user, h, workstation).await,
+        None => rpc.bind_sealed(syntax, domain, user, password, workstation).await,
+    }
+}
+
 /// Stage 1 live: authenticated `RemoteCreateInstance` of `clsid` on `host` (ISystemActivator over
 /// a sealed ncacn_ip_tcp:135 bind), requesting `iids`. Returns the activated object's StdObjRef
 /// (OXID/OID/IPID — the handle Stage 2 resolves + binds) and the activation HRESULT.
@@ -297,11 +313,14 @@ pub async fn remote_create_instance(
     domain: &str,
     user: &str,
     password: &str,
+    nt_hash: Option<&[u8; 16]>,
     workstation: &str,
     clsid: &str,
     iids: &[&str],
 ) -> Result<(StdObjRef, i32)> {
-    let reply = remote_create_instance_raw(host, domain, user, password, workstation, clsid, iids).await?;
+    let reply =
+        remote_create_instance_raw(host, domain, user, password, nt_hash, workstation, clsid, iids)
+            .await?;
     let hr = activation_hresult(&reply);
     let obj = parse_stdobjref(&reply)?;
     Ok((obj, hr))
@@ -314,6 +333,7 @@ pub async fn remote_create_instance_raw(
     domain: &str,
     user: &str,
     password: &str,
+    nt_hash: Option<&[u8; 16]>,
     workstation: &str,
     clsid: &str,
     iids: &[&str],
@@ -324,11 +344,13 @@ pub async fn remote_create_instance_raw(
         format!("{host}:135")
     };
     let mut rpc = RpcTcp::connect(&addr).await?;
-    rpc.bind_sealed(
+    bind_wmi(
+        &mut rpc,
         Syntax::new(IID_ISYSTEM_ACTIVATOR, 0, 0),
         domain,
         user,
         password,
+        nt_hash,
         workstation,
     )
     .await?;
@@ -394,6 +416,7 @@ pub async fn wmi_connect(
     domain: &str,
     user: &str,
     password: &str,
+    nt_hash: Option<&[u8; 16]>,
     workstation: &str,
 ) -> Result<WmiSession> {
     // Stage 1 — activate the login object on the SCM (:135).
@@ -402,6 +425,7 @@ pub async fn wmi_connect(
         domain,
         user,
         password,
+        nt_hash,
         workstation,
         CLSID_WBEM_LEVEL1_LOGIN,
         &[IID_IWBEM_LEVEL1_LOGIN],
@@ -420,11 +444,13 @@ pub async fn wmi_connect(
     let host_ip = host.split(':').next().unwrap_or(host).to_string();
     let addr = format!("{host_ip}:{port}");
     let mut rpc = RpcTcp::connect(&addr).await?;
-    rpc.bind_sealed(
+    bind_wmi(
+        &mut rpc,
         Syntax::new(IID_IWBEM_LEVEL1_LOGIN, 0, 0),
         domain,
         user,
         password,
+        nt_hash,
         workstation,
     )
     .await?;
@@ -451,8 +477,8 @@ pub async fn wmi_connect(
 // The in-params are an IWbemClassObject marshaled by-value as MS-WMIO (a class definition + an
 // instance heap). Rather than a full WMIO encoder, we template a captured known-good
 // `Win32_Process.Create` blob: the class definition is fixed; only the CommandLine (in the instance
-// heap, at the tail) varies. Swapping the command means re-patching the six length fields that span
-// it — validated by diffing two live captures with different command lengths.
+// heap, at the tail) varies. Swapping the command means re-patching the seven length fields that span
+// it — validated by byte-diffing adhammer's blob against impacket's for identical commands.
 const EXEC_TEMPLATE: &[u8] = include_bytes!("wmi_exec_template.bin");
 const EXEC_CMD_OFF: usize = 1850; // start of the CommandLine UTF-16LE bytes in the template
 const EXEC_CMD_LEN: usize = 82; // template CommandLine length in bytes (41 chars × 2)
@@ -508,17 +534,20 @@ pub async fn wmi_exec(
     domain: &str,
     user: &str,
     password: &str,
+    nt_hash: Option<&[u8; 16]>,
     workstation: &str,
     command: &str,
 ) -> Result<i32> {
-    let s = wmi_connect(host, domain, user, password, workstation).await?;
+    let s = wmi_connect(host, domain, user, password, nt_hash, workstation).await?;
     let addr = format!("{}:{}", s.host, s.port);
     let mut rpc = RpcTcp::connect(&addr).await?;
-    rpc.bind_sealed(
+    bind_wmi(
+        &mut rpc,
         Syntax::new(IID_IWBEM_SERVICES, 0, 0),
         domain,
         user,
         password,
+        nt_hash,
         workstation,
     )
     .await?;

@@ -12,18 +12,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clsid = "8bc3f05e-d86b-11d0-a075-00c04fb68820"; // CLSID_WbemLevel1Login
     let iid = "f309ad18-d86a-11d0-a075-00c04fb68820"; // IID_IWbemLevel1Login
 
-    let reply =
-        dcerpc::dcom_wmi::remote_create_instance_raw(&host, &domain, &user, &pass, "ADHAMMER", clsid, &[iid])
-            .await?;
-    let hr = dcerpc::dcom_wmi::activation_hresult(&reply);
-    println!("reply_len={} HRESULT=0x{:08x}", reply.len(), hr as u32);
+    let _ = (clsid, iid);
+    let command = env::var("CMD")
+        .unwrap_or_else(|_| "cmd.exe /c whoami > C:\\Windows\\Temp\\o.txt".into());
+    if env::var("DUMP").is_ok() {
+        let stub = dcerpc::dcom_wmi::exec_method_stub_dump(&command);
+        println!("{}", stub.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        return Ok(());
+    }
+    let hr = dcerpc::dcom_wmi::wmi_exec(&host, &domain, &user, &pass, "ADHAMMER", &command).await?;
+    println!("[+] Win32_Process.Create HRESULT=0x{:08x}", hr as u32);
     if hr == 0 {
-        match dcerpc::dcom_wmi::parse_stdobjref(&reply) {
-            Ok(o) => println!("[+] ACTIVATION ACCEPTED — STDOBJREF oxid={:#x} oid={:#x}", o.oxid, o.oid),
-            Err(e) => println!("[+] HRESULT ok but STDOBJREF parse: {e}"),
-        }
+        println!("[+] PROCESS CREATED via WMI: {command}");
     } else {
-        println!("[-] activation refused (0x{:08x})", hr as u32);
+        println!("[-] ExecMethod returned 0x{:08x}", hr as u32);
     }
     Ok(())
 }

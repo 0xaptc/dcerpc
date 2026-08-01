@@ -34,10 +34,16 @@ pub const COMVERSION_MINOR: u16 = 7;
 /// logical call chain). Layout: COMVERSION(4) · flags(4) · reserved(4) · CID(16) · extensions
 /// pointer(4, null) = 32 bytes.
 pub fn orpc_this(cid: &[u8; 16]) -> Vec<u8> {
+    orpc_this_flags(cid, 1)
+}
+
+/// ORPCTHIS with an explicit `flags` word: impacket sets 1 on the activation call
+/// (`RemoteCreateInstance`) but 0 on ordinary ORPC method calls (NTLMLogin, ExecMethod, …).
+pub fn orpc_this_flags(cid: &[u8; 16], flags: u32) -> Vec<u8> {
     let mut e = NdrEncoder::new();
     e.u16(COMVERSION_MAJOR);
     e.u16(COMVERSION_MINOR);
-    e.u32(1); // flags (ORPCF — impacket sets 1 on activation ORPCTHIS)
+    e.u32(flags);
     e.u32(0); // reserved1
     e.uuid(cid); // CID (causality id)
     e.null_ptr(); // ORPC_EXTENT_ARRAY* extensions (none)

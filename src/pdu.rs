@@ -160,6 +160,35 @@ pub fn build_request_sealed(
     pdu
 }
 
+/// As [`build_request_sealed`] but an ORPC (DCOM object) request: sets `PFC_OBJECT_UUID` and inserts
+/// the 16-byte object UUID (the target interface's IPID) between the opnum and the stub. The stub
+/// therefore begins at offset 40 (header 16 + alloc_hint 4 + p_cont_id 2 + opnum 2 + object 16).
+pub fn build_request_sealed_object(
+    call_id: u32,
+    p_cont_id: u16,
+    opnum: u16,
+    object: &[u8; 16],
+    sealed_stub: &[u8],
+    pad_len: u8,
+    signature: &[u8],
+    alloc_hint: u32,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(24 + sealed_stub.len());
+    body.extend_from_slice(&alloc_hint.to_le_bytes());
+    body.extend_from_slice(&p_cont_id.to_le_bytes());
+    body.extend_from_slice(&opnum.to_le_bytes());
+    body.extend_from_slice(object); // ORPC object UUID (IPID)
+    body.extend_from_slice(sealed_stub);
+
+    let frag_length = (16 + body.len() + 8 + signature.len()) as u16;
+    let mut pdu = header_auth(ptype::REQUEST, frag_length, signature.len() as u16, call_id);
+    pdu[3] |= 0x80; // PFC_OBJECT_UUID
+    pdu.extend_from_slice(&body);
+    pdu.extend_from_slice(&sec_trailer(pad_len));
+    pdu.extend_from_slice(signature);
+    pdu
+}
+
 /// Split a sealed RESPONSE into (sealed_stub‖pad, signature), stripping the sec_trailer.
 /// The caller unseals the stub and drops `auth_pad_length` trailing pad bytes.
 pub fn split_sealed_response(buf: &[u8]) -> Result<(Vec<u8>, Vec<u8>, u8)> {

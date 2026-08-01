@@ -25,7 +25,9 @@
 //! ORPCTHIS `flags = 1`. Stages 2–3 (OXID resolve → `NTLMLogin` → `IWbemServices::ExecMethod`
 //! `Win32_Process.Create`) build on this.
 
-use crate::dcom::{orpc_this, IID_ISYSTEM_ACTIVATOR};
+use crate::dcom::{
+    orpc_this, orpc_this_flags, IID_ISYSTEM_ACTIVATOR, IID_IWBEM_LEVEL1_LOGIN, IID_IWBEM_SERVICES,
+};
 use crate::ndr::{NdrDecoder, NdrEncoder};
 use crate::transport::RpcTcp;
 use crate::{Result, RpcError, Syntax};
@@ -333,6 +335,198 @@ pub async fn remote_create_instance_raw(
     let cid = [0x5Au8; 16]; // causality id for this logical call chain
     rpc.call_sealed(4, &remote_create_instance_stub(&cid, clsid, iids))
         .await
+}
+
+// ---- Stage 2: OXID binding → NTLMLogin → IWbemServices ------------------------------------------
+
+const CLSID_WBEM_LEVEL1_LOGIN: &str = "8bc3f05e-d86b-11d0-a075-00c04fb68820";
+
+/// Scan a RemoteCreateInstance reply's OXID bindings for the object's dynamic ncacn_ip_tcp port. The
+/// binding is a UTF-16LE string of the form `host[port]`; we only need the port (the caller reuses
+/// the original target IP, avoiding a NetBIOS-name resolution that may fail from a Linux attacker).
+fn parse_oxid_binding_port(reply: &[u8]) -> Result<u16> {
+    let mut cur = String::new();
+    for c in reply.chunks_exact(2) {
+        let w = u16::from_le_bytes([c[0], c[1]]);
+        if w == 0 {
+            if let Some((_host, rest)) = cur.rsplit_once('[') {
+                if let Some(p) = rest.strip_suffix(']').and_then(|s| s.parse::<u16>().ok()) {
+                    return Ok(p);
+                }
+            }
+            cur.clear();
+        } else if let Some(ch) = char::from_u32(w as u32) {
+            cur.push(ch);
+        }
+    }
+    Err(RpcError::Protocol("no host[port] OXID binding in reply".into()))
+}
+
+/// `IWbemLevel1Login::NTLMLogin` (opnum 6) stub: ORPCTHIS + wszNetworkResource (the WMI namespace,
+/// e.g. `//./root/cimv2`) + wszPreferredLocale(null) + lFlags(0) + pCtx(null). Object ORPC calls use
+/// ORPCTHIS flags = 0 (unlike the activation call).
+fn ntlm_login_stub(cid: &[u8; 16], namespace: &str) -> Vec<u8> {
+    let mut e = NdrEncoder::new();
+    e.bytes(&orpc_this_flags(cid, 0));
+    e.referent(); // wszNetworkResource [in, string, unique]
+    e.conformant_varying_wstr(namespace);
+    e.align(4);
+    e.null_ptr(); // wszPreferredLocale (null)
+    e.u32(0); // lFlags
+    e.null_ptr(); // pCtx (IWbemContext*, null)
+    e.into_bytes()
+}
+
+/// A logged-in WMI session on `root\cimv2`: a sealed ncacn_ip_tcp connection to the WMI provider's
+/// endpoint plus the `IWbemServices` IPID, ready for Stage 3 (`ExecMethod` Win32_Process.Create).
+pub struct WmiSession {
+    pub host: String,
+    pub port: u16,
+    pub services_ipid: [u8; 16],
+    pub oxid: u64,
+}
+
+/// Stages 1+2: activate `CLSID_WbemLevel1Login`, resolve its dynamic endpoint from the reply
+/// bindings, bind sealed to `IWbemLevel1Login`, and `NTLMLogin(//./root/cimv2)` → an
+/// `IWbemServices` interface pointer. Returns the session Stage 3 uses.
+pub async fn wmi_connect(
+    host: &str,
+    domain: &str,
+    user: &str,
+    password: &str,
+    workstation: &str,
+) -> Result<WmiSession> {
+    // Stage 1 — activate the login object on the SCM (:135).
+    let reply = remote_create_instance_raw(
+        host,
+        domain,
+        user,
+        password,
+        workstation,
+        CLSID_WBEM_LEVEL1_LOGIN,
+        &[IID_IWBEM_LEVEL1_LOGIN],
+    )
+    .await?;
+    let hr = activation_hresult(&reply);
+    if hr != 0 {
+        return Err(RpcError::Protocol(format!(
+            "WMI activation refused (HRESULT {hr:#010x})"
+        )));
+    }
+    let login = parse_stdobjref(&reply)?; // IWbemLevel1Login OXID/OID/IPID
+    let port = parse_oxid_binding_port(&reply)?;
+
+    // Stage 2 — bind to the object's dynamic endpoint and log in.
+    let host_ip = host.split(':').next().unwrap_or(host).to_string();
+    let addr = format!("{host_ip}:{port}");
+    let mut rpc = RpcTcp::connect(&addr).await?;
+    rpc.bind_sealed(
+        Syntax::new(IID_IWBEM_LEVEL1_LOGIN, 0, 0),
+        domain,
+        user,
+        password,
+        workstation,
+    )
+    .await?;
+    let cid = [0x5Au8; 16];
+    let stub = ntlm_login_stub(&cid, "//./root/cimv2");
+    let resp = rpc.call_sealed_object(6, &login.ipid, &stub).await?;
+    let hr = activation_hresult(&resp);
+    if hr != 0 {
+        return Err(RpcError::Protocol(format!(
+            "NTLMLogin failed (HRESULT {hr:#010x})"
+        )));
+    }
+    let svc = parse_stdobjref(&resp)?; // IWbemServices
+    Ok(WmiSession {
+        host: host_ip,
+        port,
+        services_ipid: svc.ipid,
+        oxid: svc.oxid,
+    })
+}
+
+// ---- Stage 3: IWbemServices::ExecMethod Win32_Process.Create -------------------------------------
+//
+// The in-params are an IWbemClassObject marshaled by-value as MS-WMIO (a class definition + an
+// instance heap). Rather than a full WMIO encoder, we template a captured known-good
+// `Win32_Process.Create` blob: the class definition is fixed; only the CommandLine (in the instance
+// heap, at the tail) varies. Swapping the command means re-patching the six length fields that span
+// it — validated by diffing two live captures with different command lengths.
+const EXEC_TEMPLATE: &[u8] = include_bytes!("wmi_exec_template.bin");
+const EXEC_CMD_OFF: usize = 1850; // start of the CommandLine UTF-16LE bytes in the template
+const EXEC_CMD_LEN: usize = 82; // template CommandLine length in bytes (41 chars × 2)
+/// Plain u32 length fields that span the CommandLine: pInParams ulCntData/max_count, OBJREF
+/// ObjectReferenceSize, WMIO ObjectEncodingLength, the InstancePart EncodingLength, and the
+/// InstanceData/value-table length (1818).
+const EXEC_LEN_FIELDS: [usize; 6] = [120, 124, 172, 180, 1804, 1818];
+const EXEC_HEAP_LEN_OFF: usize = 1831; // InstanceHeap HeapLength (top bit set; patch the low 31)
+
+fn patch_len(buf: &mut [u8], off: usize, delta: i64) {
+    let v = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+    let nv = (v as i64 + delta) as u32;
+    buf[off..off + 4].copy_from_slice(&nv.to_le_bytes());
+}
+
+/// `IWbemServices::ExecMethod` (opnum 24) stub for `Win32_Process.Create <command>`, built by
+/// templating the captured blob: fresh ORPCTHIS, the CommandLine spliced in, and every length field
+/// spanning it adjusted by the byte delta.
+/// Debug helper: the ExecMethod stub for `command` with a fixed CID (for byte-diffing vs impacket).
+pub fn exec_method_stub_dump(command: &str) -> Vec<u8> {
+    exec_method_stub(&[0x5Au8; 16], command)
+}
+
+fn exec_method_stub(cid: &[u8; 16], command: &str) -> Vec<u8> {
+    let mut t = EXEC_TEMPLATE.to_vec();
+    t[..32].copy_from_slice(&orpc_this_flags(cid, 0)); // ORPCTHIS (flags 0)
+    let new_cmd: Vec<u8> = command
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let delta = new_cmd.len() as i64 - EXEC_CMD_LEN as i64;
+    for &off in &EXEC_LEN_FIELDS {
+        patch_len(&mut t, off, delta);
+    }
+    // InstanceHeap HeapLength keeps its top bit (0x80000000) set; adjust the low 31.
+    let v = u32::from_le_bytes(t[EXEC_HEAP_LEN_OFF..EXEC_HEAP_LEN_OFF + 4].try_into().unwrap());
+    let nv = (v & 0x8000_0000) | (((v & 0x7fff_ffff) as i64 + delta) as u32 & 0x7fff_ffff);
+    t[EXEC_HEAP_LEN_OFF..EXEC_HEAP_LEN_OFF + 4].copy_from_slice(&nv.to_le_bytes());
+
+    let mut out = Vec::with_capacity(t.len() + delta.max(0) as usize);
+    out.extend_from_slice(&t[..EXEC_CMD_OFF]);
+    out.extend_from_slice(&new_cmd);
+    out.extend_from_slice(&t[EXEC_CMD_OFF + EXEC_CMD_LEN..]);
+    out
+}
+
+/// Full wmiexec: Stages 1+2 ([`wmi_connect`]) then `Win32_Process.Create <command>` on a sealed
+/// `IWbemServices` bind. Returns the method's HRESULT (0 = the process was created; the ProcessId is
+/// in the out-params). The command runs detached under WmiPrvSE, so redirect output to a file and
+/// read it back over C$ if you need it.
+pub async fn wmi_exec(
+    host: &str,
+    domain: &str,
+    user: &str,
+    password: &str,
+    workstation: &str,
+    command: &str,
+) -> Result<i32> {
+    let s = wmi_connect(host, domain, user, password, workstation).await?;
+    let addr = format!("{}:{}", s.host, s.port);
+    let mut rpc = RpcTcp::connect(&addr).await?;
+    rpc.bind_sealed(
+        Syntax::new(IID_IWBEM_SERVICES, 0, 0),
+        domain,
+        user,
+        password,
+        workstation,
+    )
+    .await?;
+    let cid = [0x5Au8; 16];
+    let resp = rpc
+        .call_sealed_object(24, &s.services_ipid, &exec_method_stub(&cid, command))
+        .await?;
+    Ok(activation_hresult(&resp))
 }
 
 #[cfg(test)]

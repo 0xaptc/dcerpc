@@ -169,6 +169,80 @@ impl RpcTcp {
         }
         Ok(plain)
     }
+
+    /// An ORPC (DCOM object) sealed request: like [`call_sealed`](Self::call_sealed) but carries the
+    /// target object's IPID as the PDU object UUID (stub offset 40). Used for method calls on an
+    /// activated DCOM interface (IWbemLevel1Login, IWbemServices …).
+    pub async fn call_sealed_object(
+        &mut self,
+        opnum: u16,
+        object: &[u8; 16],
+        stub: &[u8],
+    ) -> Result<Vec<u8>> {
+        const STUB_OFF: usize = 40; // header(16)+alloc(4)+cont(2)+opnum(2)+object(16)
+        let pad_len = ((4 - (stub.len() % 4)) % 4) as u8;
+        let mut stub_padded = stub.to_vec();
+        stub_padded.extend(std::iter::repeat(0u8).take(pad_len as usize));
+
+        let mut req = pdu::build_request_sealed_object(
+            self.call_id,
+            0,
+            opnum,
+            object,
+            &stub_padded,
+            pad_len,
+            &[0u8; 16],
+            stub.len() as u32,
+        );
+        self.call_id += 1;
+        let n = req.len();
+        let sign_over = req[..n - 16].to_vec();
+        let seal = self
+            .seal
+            .as_mut()
+            .ok_or_else(|| RpcError::Protocol("session not sealed".into()))?;
+        let (sealed, signature) = seal.seal_pdu(&sign_over, &stub_padded);
+        req[STUB_OFF..STUB_OFF + stub_padded.len()].copy_from_slice(&sealed);
+        req[n - 16..].copy_from_slice(&signature);
+        self.send(&req).await?;
+
+        // RESPONSE PDUs carry no object UUID — their stub begins at 24 (header 16 + alloc_hint 4 +
+        // p_cont_id 2 + cancel_count 1 + reserved 1), unlike the request's 40.
+        const RESP_STUB_OFF: usize = 24;
+        const PFC_LAST_FRAG: u8 = 0x02;
+        let mut plain = Vec::new();
+        loop {
+            let resp = self.recv().await?;
+            let h = pdu::parse_header(&resp)?;
+            if h.ptype == pdu::ptype::FAULT {
+                let status = resp
+                    .get(24..28)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0);
+                return Err(RpcError::Fault(status));
+            }
+            if h.ptype != pdu::ptype::RESPONSE {
+                return Err(RpcError::UnexpectedPdu(h.ptype));
+            }
+            let pfc = resp[3];
+            let auth_length = u16::from_le_bytes([resp[10], resp[11]]) as usize;
+            let frag = (h.frag_length as usize).min(resp.len());
+            let sec_trailer_start = frag - 8 - auth_length;
+            let resp_pad = resp[sec_trailer_start + 2] as usize;
+            let sig = resp[frag - auth_length..frag].to_vec();
+            let pdu_no_sig = &resp[..frag - auth_length];
+            let seal = self.seal.as_mut().unwrap();
+            let mut chunk = seal
+                .unseal_pdu(pdu_no_sig, RESP_STUB_OFF, sec_trailer_start - RESP_STUB_OFF, &sig)
+                .map_err(|e| RpcError::Protocol(format!("unseal response: {e}")))?;
+            chunk.truncate(chunk.len().saturating_sub(resp_pad));
+            plain.extend_from_slice(&chunk);
+            if pfc & PFC_LAST_FRAG != 0 {
+                break;
+            }
+        }
+        Ok(plain)
+    }
 }
 
 /// DCE/RPC over an SMB2 named pipe: each bind/request is one FSCTL_PIPE_TRANSCEIVE.

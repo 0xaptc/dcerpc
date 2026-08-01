@@ -183,9 +183,11 @@ pub async fn restore_password(
 /// (not just the OWF) makes AD regenerate every key — NT *and* the AES keys the schannel needs.
 fn nl_trust_password(password: &str) -> [u8; 516] {
     let utf16: Vec<u8> = password.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-    let len = utf16.len();
+    // The buffer holds at most 512 bytes; clamp so an over-long cleartext can't underflow the slice
+    // (machine passwords are <= 120 chars in practice, so this never triggers for real secrets).
+    let len = utf16.len().min(512);
     let mut buf = [0u8; 516];
-    buf[(512 - len)..512].copy_from_slice(&utf16);
+    buf[(512 - len)..512].copy_from_slice(&utf16[utf16.len() - len..]);
     buf[512..516].copy_from_slice(&(len as u32).to_le_bytes());
     buf
 }

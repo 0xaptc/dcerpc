@@ -15,7 +15,8 @@ pub struct RpcTcp {
 
 impl RpcTcp {
     pub async fn connect(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
+        // Routes through the process-global SOCKS5 proxy if set (addr already carries the port).
+        let stream = smb2_client::socks::dial(addr, 135).await?;
         Ok(RpcTcp {
             stream,
             call_id: 1,

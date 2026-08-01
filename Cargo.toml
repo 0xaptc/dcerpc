@@ -13,7 +13,7 @@ categories = ["network-programming", "parser-implementations", "os::windows-apis
 
 [dependencies]
 ntlmssp = "0.1"
-smb2-client = "0.1"
+smb2-client = { git = "https://github.com/icedracon/smb2-client.git", branch = "main" }
 windows-sddl = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["net", "io-util", "time"] }

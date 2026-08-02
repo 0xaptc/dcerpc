@@ -1,6 +1,6 @@
 [package]
 name = "dcerpc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Pure-Rust DCE/RPC (MS-RPCE): hand-rolled NDR marshaling, PDUs, NTLMSSP sign+seal (packet privacy), TCP + SMB named-pipe transports, EPM, and SAMR/LSAT/DRSUAPI/SVCCTL clients — no FFI."
@@ -13,7 +13,7 @@ categories = ["network-programming", "parser-implementations", "os::windows-apis
 
 [dependencies]
 ntlmssp = "0.1"
-smb2-client = { git = "https://github.com/icedracon/smb2-client.git", branch = "main" }
+smb2-client = "0.2"
 windows-sddl = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["net", "io-util", "time"] }

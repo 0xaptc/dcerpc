@@ -14,6 +14,7 @@ pub mod ptype {
 
 /// DCE/RPC authentication (MS-RPCE §2.2.2.11): NTLMSSP with packet privacy (sign+seal).
 pub const RPC_C_AUTHN_WINNT: u8 = 0x0a;
+pub const RPC_C_AUTHN_LEVEL_PKT_CONNECT: u8 = 0x02;
 pub const RPC_C_AUTHN_LEVEL_PKT_PRIVACY: u8 = 0x06;
 
 const PFC_FIRST_FRAG: u8 = 0x01;
@@ -42,9 +43,16 @@ fn header_auth(ptype: u8, frag_length: u16, auth_length: u16, call_id: u32) -> V
 
 /// The 8-byte sec_trailer that precedes the auth_value in an authenticated PDU.
 fn sec_trailer(auth_pad_length: u8) -> [u8; 8] {
+    sec_trailer_lvl(auth_pad_length, RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
+}
+
+/// `sec_trailer` with an explicit auth level — needed for relay flows that request
+/// `PKT_CONNECT` (auth-only, no per-message signing/sealing), because the relaying attacker
+/// doesn't hold the victim's NTLM session key and can't produce signatures.
+pub(crate) fn sec_trailer_lvl(auth_pad_length: u8, auth_level: u8) -> [u8; 8] {
     [
         RPC_C_AUTHN_WINNT,
-        RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+        auth_level,
         auth_pad_length,
         0,
         0,
@@ -91,6 +99,35 @@ pub fn build_bind_auth(call_id: u32, abstract_syntax: Syntax, auth_token: &[u8])
     let mut pdu = header_auth(ptype::BIND, frag_length, auth_token.len() as u16, call_id);
     pdu.extend_from_slice(&body);
     pdu.extend_from_slice(&sec_trailer(0));
+    pdu.extend_from_slice(auth_token);
+    pdu
+}
+
+/// [`build_bind_auth`] with an explicit auth level. For relay flows we ask for
+/// `PKT_CONNECT` (auth-only) so subsequent calls need no per-message signing/sealing —
+/// otherwise the middle attacker (who doesn't hold the victim's NTLM session key) can
+/// authenticate but can't send any actual RPC calls.
+pub fn build_bind_auth_level(
+    call_id: u32,
+    abstract_syntax: Syntax,
+    auth_token: &[u8],
+    auth_level: u8,
+) -> Vec<u8> {
+    let body = bind_body(abstract_syntax);
+    let frag_length = (16 + body.len() + 8 + auth_token.len()) as u16;
+    let mut pdu = header_auth(ptype::BIND, frag_length, auth_token.len() as u16, call_id);
+    pdu.extend_from_slice(&body);
+    pdu.extend_from_slice(&sec_trailer_lvl(0, auth_level));
+    pdu.extend_from_slice(auth_token);
+    pdu
+}
+
+/// [`build_auth3`] with an explicit auth level (see [`build_bind_auth_level`]).
+pub fn build_auth3_level(call_id: u32, auth_token: &[u8], auth_level: u8) -> Vec<u8> {
+    let frag_length = (16 + 4 + 8 + auth_token.len()) as u16;
+    let mut pdu = header_auth(ptype::AUTH3, frag_length, auth_token.len() as u16, call_id);
+    pdu.extend_from_slice(&[0, 0, 0, 0]);
+    pdu.extend_from_slice(&sec_trailer_lvl(0, auth_level));
     pdu.extend_from_slice(auth_token);
     pdu
 }

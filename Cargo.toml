@@ -1,6 +1,6 @@
 [package]
 name = "dcerpc"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.74"
 description = "Pure-Rust DCE/RPC (MS-RPCE): hand-rolled NDR marshaling, PDUs, NTLMSSP sign+seal (packet privacy), TCP + SMB named-pipe transports, EPM, and SAMR/LSAT/DRSUAPI/SVCCTL clients — no FFI."
@@ -12,16 +12,17 @@ keywords = ["dcerpc", "msrpc", "ndr", "samr", "windows"]
 categories = ["network-programming", "parser-implementations", "os::windows-apis"]
 
 [dependencies]
+ms-ndr = { path = "../ms-ndr", version = "0.1" }
 ntlmssp = "0.1"
 smb2-client = "0.2"
 windows-sddl = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["net", "io-util", "time"] }
 tracing = "0.1"
-md-5 = "0.10"
-des = "0.8"
 hex = "0.4"
 aes = "0.8"
+des = "0.8"
+md-5 = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
 

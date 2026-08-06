@@ -651,6 +651,7 @@ mod tests {
             &dom,
             &user,
             &pass,
+            None,
             "ADHAMMER",
             CLSID_WBEM_LEVEL1_LOGIN,
             &[IID_IWBEM_LEVEL1_LOGIN],

@@ -36,6 +36,47 @@ fn utf16z(s: &str) -> Vec<u8> {
     v
 }
 
+/// UTF-16LE `s` with a trailing NUL. Public so callers building relay flows can prepare the
+/// `CertificateTemplate:<name>` attributes blob without pulling in a duplicate encoder.
+pub fn utf16z_string(s: &str) -> Vec<u8> {
+    utf16z(s)
+}
+
+/// Opnum of `CertServerRequest` — exported so relay flows can call it via the transport.
+pub const CERT_SERVER_REQUEST_OPNUM: u16 = CERT_SERVER_REQUEST;
+
+/// Marshal `CertServerRequest` [in] params for a caller that owns its own transport
+/// (e.g. an ncacn_ip_tcp `RpcTcp` after a relayed bind). Same NDR shape as the sealed-pipe
+/// path; broken out so the relay code doesn't duplicate the encoder.
+pub fn encode_cert_server_request(authority: &str, template: &str, csr_der: &[u8]) -> Vec<u8> {
+    let attribs = utf16z(&format!("CertificateTemplate:{template}"));
+    encode_request(authority, &attribs, csr_der)
+}
+
+/// Decode the `CertServerRequest` reply stub into `(disposition, cert_der, message)`. Same
+/// shape as the sealed-pipe path.
+pub fn decode_cert_server_response(stub: &[u8]) -> Result<EnrollResult> {
+    let mut d = NdrDecoder::new(stub);
+    let _request_id = d.u32()?;
+    let disposition = d.u32()?;
+    let _chain = read_blob(&mut d)?;
+    let cert_der = read_blob(&mut d)?;
+    let msg_raw = read_blob(&mut d)?;
+    let message = String::from_utf16_lossy(
+        &msg_raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect::<Vec<_>>(),
+    )
+    .trim_end_matches('\0')
+    .to_string();
+    Ok(EnrollResult {
+        disposition,
+        cert_der,
+        message,
+    })
+}
+
 /// Marshal CertServerRequest [in] params. `pwszAuthority` is a top-level unique string (referent
 /// + inline WSTR); each CERTTRANSBLOB is a [ref] struct {cb, [unique] pb} with the byte array
 /// deferred after both fixed parts.

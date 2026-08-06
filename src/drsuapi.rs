@@ -1,5 +1,10 @@
 //! DRSUAPI (MS-DRSR) — the directory replication interface used for DCSync.
 //!
+//! DEPRECATED: this module is kept as-is for backward compatibility. New code should
+//! depend on the standalone [`ms-drsr`](https://crates.io/crates/ms-drsr) crate — it
+//! ships the same protocol with faster iteration and no dcerpc coupling. This module
+//! will be removed in dcerpc 0.4.0.
+//!
 //! DCSync abuses replication: bind to DRSUAPI over a sign+sealed ncacn_ip_tcp channel
 //! (`DRSBind`), then request a single object's secrets with `DRSGetNCChanges`
 //! (EXOP_REPL_OBJ). The reply carries the account's attributes with the secrets encrypted

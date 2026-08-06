@@ -26,7 +26,9 @@ pub fn winreg_syntax() -> Syntax {
 pub mod opnum {
     pub const OPEN_LOCAL_MACHINE: u16 = 2; // OpenHKLM
     pub const BASE_REG_CLOSE_KEY: u16 = 5;
+    pub const BASE_REG_ENUM_KEY: u16 = 9;
     pub const BASE_REG_OPEN_KEY: u16 = 15;
+    pub const BASE_REG_QUERY_INFO_KEY: u16 = 16;
     pub const BASE_REG_QUERY_VALUE: u16 = 17;
 }
 
@@ -111,10 +113,14 @@ fn encode_open_local_machine() -> Vec<u8> {
 }
 
 fn encode_open_key(hkey: &Hkey, subkey: &str) -> Vec<u8> {
+    encode_open_key_opts(hkey, subkey, 0)
+}
+
+fn encode_open_key_opts(hkey: &Hkey, subkey: &str, dw_options: u32) -> Vec<u8> {
     let mut e = NdrEncoder::new();
     hkey.encode(&mut e);
     encode_ustr(&mut e, subkey);
-    e.u32(0); // dwOptions (REG_OPTION_NON_VOLATILE)
+    e.u32(dw_options); // dwOptions; REG_OPTION_BACKUP_RESTORE=4 uses SeBackupPrivilege on SAM/SECURITY
     e.u32(KEY_READ); // samDesired
     e.into_bytes()
 }
@@ -252,6 +258,199 @@ impl<'a> RegistryClient<'a> {
         self.close(&hklm).await;
         v
     }
+
+    /// Open `HKLM` as a reusable handle — for multi-key flows (secretsdump-via-RRP) that
+    /// don't want to reopen HKLM on every read.
+    pub async fn hklm(&mut self) -> Result<Hkey> {
+        self.open_hklm().await
+    }
+
+    /// Open a subkey under `parent`. Publicly exposed for callers that need to chain
+    /// key opens (e.g. enumerate SAM users under a pre-opened `SAM\SAM\Domains\Account\Users`).
+    pub async fn open(&mut self, parent: &Hkey, subkey: &str) -> Result<Hkey> {
+        self.open_key(parent, subkey).await
+    }
+
+    /// Open a subkey with `REG_OPTION_BACKUP_RESTORE` (dwOptions=4) — the flag that tells
+    /// the remote registry to honor `SeBackupPrivilege` on protected hives (`SAM`, `SECURITY`).
+    /// A DA-level session's token has SeBackupPrivilege granted; this flag turns "denied"
+    /// on `HKLM\SAM\…` into a successful read. Matches impacket-secretsdump's approach.
+    pub async fn open_backup(&mut self, parent: &Hkey, subkey: &str) -> Result<Hkey> {
+        let resp = self
+            .pipe
+            .call_sealed(
+                opnum::BASE_REG_OPEN_KEY,
+                &encode_open_key_opts(parent, subkey, 4),
+            )
+            .await?;
+        let mut d = NdrDecoder::new(&resp);
+        let h = Hkey::decode(&mut d)?;
+        let ret = d.u32().unwrap_or(u32::MAX);
+        if ret != 0 || h.is_null() {
+            return Err(RpcError::Protocol(format!(
+                "BaseRegOpenKey('{subkey}', BACKUP_RESTORE) failed ({ret})"
+            )));
+        }
+        Ok(h)
+    }
+
+    /// Read a value under an already-open key. Publicly exposed for multi-value flows.
+    pub async fn query(&mut self, key: &Hkey, value: &str) -> Result<RegValue> {
+        self.query_value(key, value).await
+    }
+
+    /// Close a handle when done. Publicly exposed.
+    pub async fn close_handle(&mut self, key: &Hkey) {
+        self.close(key).await;
+    }
+
+    /// `BaseRegQueryInfoKey` — return the key's *class name* (the field the SAM bootkey lives
+    /// in: 8 hex chars each in the class of `HKLM\SYSTEM\…\Lsa\{JD,Skew1,GBG,Data}`). Other
+    /// fields the opnum returns are ignored — impacket-secretsdump's SYSTEM-only path also
+    /// uses this exact primitive.
+    pub async fn query_info_class(&mut self, key: &Hkey) -> Result<String> {
+        let resp = self
+            .pipe
+            .call_sealed(
+                opnum::BASE_REG_QUERY_INFO_KEY,
+                &encode_query_info_key(key),
+            )
+            .await?;
+        decode_query_info_class(&resp)
+    }
+
+    /// `BaseRegEnumKey` — return the `dwIndex`-th subkey name of `key`, or `Ok(None)` once the
+    /// enumerator runs off the end (`STATUS_NO_MORE_ITEMS = 259 = 0x103`). For SAM user
+    /// enumeration under `SAM\SAM\Domains\Account\Users`.
+    pub async fn enum_key(&mut self, key: &Hkey, dw_index: u32) -> Result<Option<String>> {
+        let resp = self
+            .pipe
+            .call_sealed(opnum::BASE_REG_ENUM_KEY, &encode_enum_key(key, dw_index))
+            .await?;
+        decode_enum_key(&resp)
+    }
+}
+
+// ─── QueryInfoKey / EnumKey wire helpers ──────────────────────────────────────────────────
+
+/// Encode `BaseRegQueryInfoKey(hKey, lpClassIn={empty, max=1024})`. The `lpClassIn` is a
+/// hint of how big a class buffer we can accept; 1024 is well above the 8-char classes we
+/// actually read (bootkey source).
+fn encode_query_info_key(key: &Hkey) -> Vec<u8> {
+    let mut e = NdrEncoder::new();
+    key.encode(&mut e);
+    // lpClassIn: RRP_UNICODE_STRING with Length=0, MaximumLength=1024 (bytes), Buffer referent.
+    e.u16(0); // Length
+    e.u16(1024); // MaximumLength
+    e.referent(); // Buffer
+    e.u32(512); // max_count (wchars = 1024 bytes / 2)
+    e.u32(0); // offset
+    e.u32(0); // actual_count (empty in-value)
+    e.into_bytes()
+}
+
+/// Decode `BaseRegQueryInfoKey`: consume up to lpClassOut and return its UTF-16LE text.
+/// The rest of the reply (subkey/value counts, last-write time, HRESULT) is discarded — we
+/// only care about the class name here.
+fn decode_query_info_class(stub: &[u8]) -> Result<String> {
+    let mut d = NdrDecoder::new(stub);
+    // lpClassOut: RRP_UNICODE_STRING { Length, MaximumLength, Buffer[unique] } then deferred
+    // WSTR buffer if referent != 0. Length is the used bytes (NUL included).
+    let length = d.u16()?;
+    let _maximum_length = d.u16()?;
+    let referent = d.u32()?;
+    if referent == 0 || length == 0 {
+        return Ok(String::new());
+    }
+    let _max = d.u32()?;
+    let _off = d.u32()?;
+    let actual = d.u32()? as usize;
+    let mut units = Vec::with_capacity(actual);
+    for _ in 0..actual {
+        units.push(d.u16()?);
+    }
+    // Strip trailing NUL(s).
+    while units.last() == Some(&0) {
+        units.pop();
+    }
+    Ok(String::from_utf16_lossy(&units))
+}
+
+/// Encode `BaseRegEnumKey(hKey, dwIndex, lpNameIn={empty,max=1024}, lpClassIn=64-spaces)`.
+///
+/// Matches impacket's `hBaseRegEnumKey` byte-for-byte: `lpNameIn` is an EMPTY RRP_UNICODE_STRING
+/// with MaximumLength=1024 (so the server can write up to 512 wchars into its buffer), and
+/// `lpClassIn` is `' ' * 64` — impacket's exact placeholder. Sending an "empty pointer" for
+/// `lpClassIn` gets `nca_s_fault_ndr` on Server 2016+; a real 64-char string is what the
+/// server's stub expects.
+fn encode_enum_key(key: &Hkey, dw_index: u32) -> Vec<u8> {
+    const CAP_WCHARS: u32 = 512;
+    let mut e = NdrEncoder::new();
+    key.encode(&mut e);
+    e.u32(dw_index);
+    // lpNameIn — INLINE (not pointer): Length=0, MaximumLength=1024, Buffer referent,
+    // deferred conformant-varying with actual_count=0 (no bytes follow).
+    e.u16(0);
+    e.u16((CAP_WCHARS * 2) as u16);
+    e.referent();
+    e.u32(CAP_WCHARS); // max_count
+    e.u32(0); // offset
+    e.u32(0); // actual_count = 0 (empty)
+    // lpClassIn [in,unique] → non-null pointer to RRP_UNICODE_STRING("                                                                ")
+    // exactly what impacket does (' ' * 64 = 64 wchars).
+    e.referent(); // top-level unique pointer referent
+    const SPACES: u32 = 64;
+    // deferred pointee: RRP_UNICODE_STRING
+    e.u16((SPACES * 2) as u16); // Length (bytes)
+    e.u16((SPACES * 2 + 2) as u16); // MaximumLength (bytes, includes trailing NUL slot)
+    e.referent(); // Buffer
+    e.u32(SPACES + 1); // max_count = 65 wchars (spaces + NUL)
+    e.u32(0);
+    e.u32(SPACES); // actual_count = 64 (the 64 spaces impacket sends)
+    for _ in 0..SPACES {
+        e.u16(0x20); // ' '
+    }
+    // lpftLastWriteTime [in,out,unique] → NULL
+    e.null_ptr();
+    e.into_bytes()
+}
+
+/// Decode `BaseRegEnumKey`: pull out the returned subkey name.
+/// Returns `Ok(None)` if the server signalled `STATUS_NO_MORE_ITEMS` (0x00000103) at the
+/// tail — the normal end-of-enumeration marker.
+fn decode_enum_key(stub: &[u8]) -> Result<Option<String>> {
+    if stub.len() < 4 {
+        return Ok(None);
+    }
+    let ret = u32::from_le_bytes(stub[stub.len() - 4..].try_into().unwrap());
+    if ret == 0x0000_0103 || ret == 0x0000_00EA {
+        // NO_MORE_ITEMS or MORE_DATA at end — treat as "done".
+        return Ok(None);
+    }
+    if ret != 0 {
+        return Err(RpcError::Protocol(format!(
+            "BaseRegEnumKey failed (win32 {ret})"
+        )));
+    }
+    let mut d = NdrDecoder::new(stub);
+    // lpNameOut RRP_UNICODE_STRING { Length, MaximumLength, Buffer[unique] }
+    let length = d.u16()?;
+    let _max_len = d.u16()?;
+    let referent = d.u32()?;
+    if referent == 0 || length == 0 {
+        return Ok(Some(String::new()));
+    }
+    let _max = d.u32()?;
+    let _off = d.u32()?;
+    let actual = d.u32()? as usize;
+    let mut units = Vec::with_capacity(actual);
+    for _ in 0..actual {
+        units.push(d.u16()?);
+    }
+    while units.last() == Some(&0) {
+        units.pop();
+    }
+    Ok(Some(String::from_utf16_lossy(&units)))
 }
 
 #[cfg(test)]

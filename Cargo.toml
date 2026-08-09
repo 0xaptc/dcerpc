@@ -2,14 +2,16 @@
 name = "dcerpc"
 version = "0.2.2"
 edition = "2021"
+authors = ["zevs"]
 rust-version = "1.74"
-description = "Pure-Rust DCE/RPC (MS-RPCE): hand-rolled NDR marshaling, PDUs, NTLMSSP sign+seal (packet privacy), TCP + SMB named-pipe transports, EPM, and SAMR/LSAT/DRSUAPI/SVCCTL clients — no FFI."
+description = "Pure-Rust DCE/RPC (MS-RPCE): hand-rolled NDR marshaling, PDUs, NTLMSSP sign+seal (packet privacy), TCP + SMB named-pipe transports, EPM, and SAMR/LSAT/DRSUAPI/SVCCTL/RRP/Netlogon/DCOM-WMI clients — no FFI"
 license = "MIT"
 repository = "https://github.com/icedracon/dcerpc"
+homepage = "https://github.com/icedracon/dcerpc"
 documentation = "https://docs.rs/dcerpc"
 readme = "README.md"
 keywords = ["dcerpc", "msrpc", "ndr", "samr", "windows"]
-categories = ["network-programming", "parser-implementations", "os::windows-apis"]
+categories = ["network-programming", "parser-implementations", "os::windows-apis", "authentication"]
 
 [dependencies]
 ms-ndr = { path = "../ms-ndr", version = "0.1" }

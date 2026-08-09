@@ -313,7 +313,12 @@ impl RpcTcp {
             let pdu_no_sig = &resp[..frag - auth_length];
             let seal = self.seal.as_mut().unwrap();
             let mut chunk = seal
-                .unseal_pdu(pdu_no_sig, RESP_STUB_OFF, sec_trailer_start - RESP_STUB_OFF, &sig)
+                .unseal_pdu(
+                    pdu_no_sig,
+                    RESP_STUB_OFF,
+                    sec_trailer_start - RESP_STUB_OFF,
+                    &sig,
+                )
                 .map_err(|e| RpcError::Protocol(format!("unseal response: {e}")))?;
             chunk.truncate(chunk.len().saturating_sub(resp_pad));
             plain.extend_from_slice(&chunk);

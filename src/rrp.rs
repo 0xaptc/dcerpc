@@ -137,7 +137,7 @@ fn encode_query_value(hkey: &Hkey, value: &str) -> Vec<u8> {
     e.u32(QUERY_BUF); // max_count (conformance = buffer we offer)
     e.u32(0); // offset
     e.u32(0); // actual_count (in-value: empty)
-    // lpcbData [in,out,unique] → referent + DWORD(buffer size)
+              // lpcbData [in,out,unique] → referent + DWORD(buffer size)
     e.referent();
     e.u32(QUERY_BUF);
     // lpcbLen [in,out,unique] → referent + DWORD(0)
@@ -174,9 +174,16 @@ fn decode_query_value(stub: &[u8]) -> Result<RegValue> {
 }
 
 /// High-level RRP client bound over an SMB `\PIPE\winreg`.
+///
+/// v1.3.6 fire-and-forget close: `close_handle_no_wait` touches wire ZERO times; server-side
+/// cleanup happens via MS-RPCE §3.3.3.5.1 Context Handle Rundown when the pipe closes.
+/// Safety valve at MAX_DEFERRED flushes the OLDEST handle synchronously via TRANSCEIVE.
 pub struct RegistryClient<'a> {
     pipe: SmbPipe<'a>,
+    deferred: std::collections::VecDeque<Hkey>,
 }
+
+const MAX_DEFERRED: usize = 96;
 
 impl<'a> RegistryClient<'a> {
     /// Open `\winreg` on an already-authenticated SMB session and bind winreg (sign+seal).
@@ -194,7 +201,34 @@ impl<'a> RegistryClient<'a> {
         let mut pipe = SmbPipe::new(client, file_id);
         pipe.bind_sealed(winreg_syntax(), domain, user, password, host)
             .await?;
-        Ok(RegistryClient { pipe })
+        Ok(RegistryClient {
+            pipe,
+            deferred: std::collections::VecDeque::new(),
+        })
+    }
+
+    async fn after_open(&mut self, opened: &Hkey) -> Result<()> {
+        self.deferred.push_back(*opened);
+        if self.deferred.len() > MAX_DEFERRED {
+            if let Some(old) = self.deferred.pop_front() {
+                let _ = self
+                    .pipe
+                    .call_sealed(opnum::BASE_REG_CLOSE_KEY, &encode_close(&old))
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deferred_len(&self) -> usize {
+        self.deferred.len()
+    }
+
+    /// Test-only accessor for use from adhammer's integration test binary.
+    #[doc(hidden)]
+    pub fn __deferred_len_debug(&self) -> usize {
+        self.deferred.len()
     }
 
     async fn open_hklm(&mut self) -> Result<Hkey> {
@@ -206,8 +240,11 @@ impl<'a> RegistryClient<'a> {
         let h = Hkey::decode(&mut d)?;
         let ret = d.u32().unwrap_or(u32::MAX);
         if ret != 0 || h.is_null() {
-            return Err(RpcError::Protocol(format!("OpenLocalMachine failed ({ret})")));
+            return Err(RpcError::Protocol(format!(
+                "OpenLocalMachine failed ({ret})"
+            )));
         }
+        self.after_open(&h).await?;
         Ok(h)
     }
 
@@ -224,6 +261,7 @@ impl<'a> RegistryClient<'a> {
                 "BaseRegOpenKey('{subkey}') failed ({ret})"
             )));
         }
+        self.after_open(&h).await?;
         Ok(h)
     }
 
@@ -291,6 +329,7 @@ impl<'a> RegistryClient<'a> {
                 "BaseRegOpenKey('{subkey}', BACKUP_RESTORE) failed ({ret})"
             )));
         }
+        self.after_open(&h).await?;
         Ok(h)
     }
 
@@ -304,6 +343,31 @@ impl<'a> RegistryClient<'a> {
         self.close(key).await;
     }
 
+    /// Fire-and-forget close — **touches the wire zero times**. Marks the handle as
+    /// deferred-closable; MS-RPCE §3.3.3.5.1 Context Handle Rundown invokes
+    /// `BaseRegCloseKey` for every open handle when the `\PIPE\winreg` pipe closes at
+    /// SMB session teardown. Saves one full sealed RPC round-trip per handle.
+    ///
+    /// If the caller opens more than `MAX_DEFERRED` handles without triggering teardown,
+    /// the safety-valve in `after_open` synchronously closes the OLDEST deferred handle.
+    ///
+    /// **v1.3.4 regression note:** an earlier attempt did SMB WRITE (fire-and-forget on the
+    /// sealed PDU). MS-CIFS §3.3.4.11 message-mode pipe semantics broke that: the server
+    /// queued the CloseKey response as a discrete message, the next TRANSCEIVE returned
+    /// that stale reply, and the sealed transport's sequence counter desynced → pipe was
+    /// killed with STATUS_PIPE_CLOSING. Zero-wire is the only correct path.
+    ///
+    /// **Client-side note:** the server-side `Hkey` stays valid until pipe teardown, so a
+    /// buggy caller that "closes" a handle then reuses it will still succeed. This masks
+    /// caller bugs that would have been caught by real closes. For strict "close-now"
+    /// semantics, use [`close_handle`](Self::close_handle).
+    pub async fn close_handle_no_wait(&mut self, key: &Hkey) {
+        if let Some(pos) = self.deferred.iter().position(|h| h.0 == key.0) {
+            self.deferred.remove(pos);
+        }
+        // No wire I/O — pipe teardown will run BaseRegCloseKey via RPC rundown.
+    }
+
     /// `BaseRegQueryInfoKey` — return the key's *class name* (the field the SAM bootkey lives
     /// in: 8 hex chars each in the class of `HKLM\SYSTEM\…\Lsa\{JD,Skew1,GBG,Data}`). Other
     /// fields the opnum returns are ignored — impacket-secretsdump's SYSTEM-only path also
@@ -311,10 +375,7 @@ impl<'a> RegistryClient<'a> {
     pub async fn query_info_class(&mut self, key: &Hkey) -> Result<String> {
         let resp = self
             .pipe
-            .call_sealed(
-                opnum::BASE_REG_QUERY_INFO_KEY,
-                &encode_query_info_key(key),
-            )
+            .call_sealed(opnum::BASE_REG_QUERY_INFO_KEY, &encode_query_info_key(key))
             .await?;
         decode_query_info_class(&resp)
     }
@@ -396,8 +457,8 @@ fn encode_enum_key(key: &Hkey, dw_index: u32) -> Vec<u8> {
     e.u32(CAP_WCHARS); // max_count
     e.u32(0); // offset
     e.u32(0); // actual_count = 0 (empty)
-    // lpClassIn [in,unique] → non-null pointer to RRP_UNICODE_STRING("                                                                ")
-    // exactly what impacket does (' ' * 64 = 64 wchars).
+              // lpClassIn [in,unique] → non-null pointer to RRP_UNICODE_STRING("                                                                ")
+              // exactly what impacket does (' ' * 64 = 64 wchars).
     e.referent(); // top-level unique pointer referent
     const SPACES: u32 = 64;
     // deferred pointee: RRP_UNICODE_STRING

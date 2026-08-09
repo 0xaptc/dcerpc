@@ -13,11 +13,14 @@
 pub mod dcom;
 pub mod dcom_wmi;
 pub mod dfsnm;
-#[deprecated(since = "0.2.1", note = "moved to standalone crate `ms-drsr`; will be removed in dcerpc 0.4.0")]
+#[deprecated(
+    since = "0.2.1",
+    note = "moved to standalone crate `ms-drsr`; will be removed in dcerpc 0.4.0"
+)]
 pub mod drsuapi;
 pub mod efsr;
-pub mod fsrvp;
 pub mod epm;
+pub mod fsrvp;
 pub mod icpr;
 pub mod lsat;
 pub mod ndr;

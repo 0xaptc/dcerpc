@@ -1,6 +1,6 @@
 [package]
 name = "dcerpc"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 authors = ["zevs"]
 rust-version = "1.74"
@@ -15,7 +15,6 @@ categories = ["network-programming", "parser-implementations", "os::windows-apis
 
 [dependencies]
 ms-ndr = { path = "../ms-ndr", version = "0.1" }
-ms-nrpc = "0.1.0-dev"
 ntlmssp = "0.1"
 smb2-client = "0.2"
 windows-sddl = "0.1"

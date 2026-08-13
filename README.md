@@ -12,7 +12,7 @@ FSRVP, DFSNM, RRP, Netlogon, DCOM/WMI).
 
 Together with [`smb2-client`](https://crates.io/crates/smb2-client),
 [`ntlmssp`](https://crates.io/crates/ntlmssp) and [`ms-ndr`](https://crates.io/crates/ms-ndr),
-this is the "impacket for Rust" that didn't otherwise exist — usable from Linux/macOS against a
+this is the "spec-vector captures for Rust" that didn't otherwise exist — usable from Linux/macOS against a
 Windows domain, static-linkable, one binary.
 
 ## Status

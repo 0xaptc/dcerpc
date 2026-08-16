@@ -269,15 +269,15 @@ impl<'a> RegistryClient<'a> {
             .call_sealed(opnum::OPEN_USERS, &encode_open_users())
             .await?;
         let mut d = NdrDecoder::new(&resp);
-        let h     = Hkey::decode(&mut d)?;
-        let ret   = d.u32().unwrap_or(u32::MAX);
+        let h = Hkey::decode(&mut d)?;
+        let ret = d.u32().unwrap_or(u32::MAX);
         if ret != 0 || h.is_null() {
             return Err(RpcError::Protocol(format!("OpenUsers failed ({ret})")));
         }
         self.after_open(&h).await?;
         Ok(h)
     }
- 
+
     async fn open_key(&mut self, parent: &Hkey, subkey: &str) -> Result<Hkey> {
         let resp = self
             .pipe
@@ -338,7 +338,7 @@ impl<'a> RegistryClient<'a> {
     pub async fn hku(&mut self) -> Result<Hkey> {
         self.open_hku().await
     }
- 
+
     /// Enumerate `HKEY_USERS` subkeys and return the SIDs of principals with
     /// a logon context on the host. Each loaded user profile hive appears as a
     /// subkey named by the user's SID; `_Classes` companions are excluded.
@@ -352,10 +352,7 @@ impl<'a> RegistryClient<'a> {
         for idx in 0..MAX_SUBKEYS {
             match self.enum_key(&hku, idx).await? {
                 None => break,
-                Some(name)
-                    if name.starts_with("S-1-5-21")
-                        && !name.ends_with("_Classes") =>
-                {
+                Some(name) if name.starts_with("S-1-5-21") && !name.ends_with("_Classes") => {
                     out.push(RegistrySession { sid: name });
                 }
                 _ => {}
@@ -614,15 +611,15 @@ mod tests {
         // Same wire format, different opnum — the encoding must be identical.
         assert_eq!(encode_open_users(), encode_open_local_machine());
     }
- 
+
     #[test]
     fn registry_session_sid_filter() {
         // Keep this in sync with the filter in logged_on_sids().
         let keep = |s: &str| s.starts_with("S-1-5-21") && !s.ends_with("_Classes");
         assert!(keep("S-1-5-21-111-222-333-1103"));
-        assert!(!keep("S-1-5-21-111-222-333-1103_Classes"));  // companion hive
-        assert!(!keep(".DEFAULT"));                           // machine default profile
-        assert!(!keep("S-1-5-18"));                           // LOCAL SYSTEM
+        assert!(!keep("S-1-5-21-111-222-333-1103_Classes")); // companion hive
+        assert!(!keep(".DEFAULT")); // machine default profile
+        assert!(!keep("S-1-5-18")); // LOCAL SYSTEM
     }
 
     #[test]

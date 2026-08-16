@@ -25,6 +25,7 @@ pub fn winreg_syntax() -> Syntax {
 
 pub mod opnum {
     pub const OPEN_LOCAL_MACHINE: u16 = 2; // OpenHKLM
+    pub const OPEN_USERS: u16 = 4; // OpenHKU
     pub const BASE_REG_CLOSE_KEY: u16 = 5;
     pub const BASE_REG_ENUM_KEY: u16 = 9;
     pub const BASE_REG_OPEN_KEY: u16 = 15;
@@ -36,6 +37,8 @@ pub mod opnum {
 const KEY_READ: u32 = 0x0002_0019;
 /// Read buffer handed to BaseRegQueryValue (CA `Security` SDs are the largest values we read).
 const QUERY_BUF: u32 = 0x0002_0000; // 128 KiB
+/// Safety cap on the HKU subkey enumeration loop.
+const MAX_SUBKEYS: u32 = 100_000;
 
 /// A 20-byte RPC_HKEY policy handle (attributes u32 + 16-byte context uuid).
 #[derive(Clone, Copy, Debug, Default)]
@@ -86,6 +89,14 @@ impl RegValue {
     }
 }
 
+/// A user profile currently loaded on the target (a HKU subkey).
+/// Returned by [`RegistryClient::logged_on_sids`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistrySession {
+    /// SID of the logged-on principal (e.g. `S-1-5-21-…-1103`).
+    pub sid: String,
+}
+
 /// Encode an `RRP_UNICODE_STRING` (RPC_UNICODE_STRING): Length + MaximumLength (bytes, NUL
 /// included) + a non-null Buffer referent, then the deferred conformant-varying wchar array.
 fn encode_ustr(e: &mut NdrEncoder, s: &str) {
@@ -110,6 +121,10 @@ fn encode_open_local_machine() -> Vec<u8> {
     e.null_ptr(); // ServerName [in, unique] → NULL (this host)
     e.u32(KEY_READ); // samDesired
     e.into_bytes()
+}
+
+fn encode_open_users() -> Vec<u8> {
+    encode_open_local_machine() // identical wire format, different opnum
 }
 
 fn encode_open_key(hkey: &Hkey, subkey: &str) -> Vec<u8> {
@@ -248,6 +263,21 @@ impl<'a> RegistryClient<'a> {
         Ok(h)
     }
 
+    async fn open_hku(&mut self) -> Result<Hkey> {
+        let resp = self
+            .pipe
+            .call_sealed(opnum::OPEN_USERS, &encode_open_users())
+            .await?;
+        let mut d = NdrDecoder::new(&resp);
+        let h     = Hkey::decode(&mut d)?;
+        let ret   = d.u32().unwrap_or(u32::MAX);
+        if ret != 0 || h.is_null() {
+            return Err(RpcError::Protocol(format!("OpenUsers failed ({ret})")));
+        }
+        self.after_open(&h).await?;
+        Ok(h)
+    }
+ 
     async fn open_key(&mut self, parent: &Hkey, subkey: &str) -> Result<Hkey> {
         let resp = self
             .pipe
@@ -301,6 +331,38 @@ impl<'a> RegistryClient<'a> {
     /// don't want to reopen HKLM on every read.
     pub async fn hklm(&mut self) -> Result<Hkey> {
         self.open_hklm().await
+    }
+
+    /// Open `HKEY_USERS` as a reusable handle — for HKU enumeration flows.
+    /// Mirrors [`hklm`](Self::hklm); the handle is deferred-closed on drop.
+    pub async fn hku(&mut self) -> Result<Hkey> {
+        self.open_hku().await
+    }
+ 
+    /// Enumerate `HKEY_USERS` subkeys and return the SIDs of principals with
+    /// a logon context on the host. Each loaded user profile hive appears as a
+    /// subkey named by the user's SID; `_Classes` companions are excluded.
+    ///
+    /// Unlike SRVSVC/WKSSVC this often works **without local admin** — Everyone
+    /// has Read on HKU and subkey *names* are enumerable — but the target's
+    /// Remote Registry service must be running.
+    pub async fn logged_on_sids(&mut self) -> Result<Vec<RegistrySession>> {
+        let hku = self.open_hku().await?;
+        let mut out = Vec::new();
+        for idx in 0..MAX_SUBKEYS {
+            match self.enum_key(&hku, idx).await? {
+                None => break,
+                Some(name)
+                    if name.starts_with("S-1-5-21")
+                        && !name.ends_with("_Classes") =>
+                {
+                    out.push(RegistrySession { sid: name });
+                }
+                _ => {}
+            }
+        }
+        self.close_handle_no_wait(&hku).await;
+        Ok(out)
     }
 
     /// Open a subkey under `parent`. Publicly exposed for callers that need to chain
@@ -545,6 +607,22 @@ mod tests {
         let b = encode_open_local_machine();
         assert_eq!(le32(&b, 0), 0, "ServerName NULL");
         assert_eq!(le32(&b, 4), KEY_READ);
+    }
+
+    #[test]
+    fn open_users_stub_matches_open_local_machine() {
+        // Same wire format, different opnum — the encoding must be identical.
+        assert_eq!(encode_open_users(), encode_open_local_machine());
+    }
+ 
+    #[test]
+    fn registry_session_sid_filter() {
+        // Keep this in sync with the filter in logged_on_sids().
+        let keep = |s: &str| s.starts_with("S-1-5-21") && !s.ends_with("_Classes");
+        assert!(keep("S-1-5-21-111-222-333-1103"));
+        assert!(!keep("S-1-5-21-111-222-333-1103_Classes"));  // companion hive
+        assert!(!keep(".DEFAULT"));                           // machine default profile
+        assert!(!keep("S-1-5-18"));                           // LOCAL SYSTEM
     }
 
     #[test]

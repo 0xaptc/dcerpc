@@ -33,6 +33,7 @@ pub mod srvsvc;
 pub mod svcctl;
 pub mod transport;
 pub mod tsch;
+pub mod wkssvc;
 
 use windows_sddl::sid::Guid;
 

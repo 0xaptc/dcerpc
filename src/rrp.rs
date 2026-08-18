@@ -426,6 +426,16 @@ fn decode_query_info_class(stub: &[u8]) -> Result<String> {
     let _max = d.u32()?;
     let _off = d.u32()?;
     let actual = d.u32()? as usize;
+    // Bounded-alloc preflight: `actual` is attacker-controlled u32. Each unit is 2 wire
+    // bytes, so cap the reservation against remaining stub before `Vec::with_capacity`.
+    if actual
+        .checked_mul(2)
+        .map_or(true, |need| need > d.remaining())
+    {
+        return Err(RpcError::Protocol(format!(
+            "BaseRegQueryInfoKey: lpClassOut actual={actual} exceeds remaining stub"
+        )));
+    }
     let mut units = Vec::with_capacity(actual);
     for _ in 0..actual {
         units.push(d.u16()?);
@@ -504,6 +514,16 @@ fn decode_enum_key(stub: &[u8]) -> Result<Option<String>> {
     let _max = d.u32()?;
     let _off = d.u32()?;
     let actual = d.u32()? as usize;
+    // Bounded-alloc preflight: `actual` is attacker-controlled u32. Each unit is 2 wire
+    // bytes, so cap the reservation against remaining stub before `Vec::with_capacity`.
+    if actual
+        .checked_mul(2)
+        .map_or(true, |need| need > d.remaining())
+    {
+        return Err(RpcError::Protocol(format!(
+            "BaseRegEnumKey: lpNameOut actual={actual} exceeds remaining stub"
+        )));
+    }
     let mut units = Vec::with_capacity(actual);
     for _ in 0..actual {
         units.push(d.u16()?);
@@ -567,5 +587,44 @@ mod tests {
         let v = decode_query_value(&e.into_bytes()).unwrap();
         assert_eq!(v.ty, 4);
         assert_eq!(v.as_dword(), Some(0x0004_0000));
+    }
+
+    // Hostile server: RRP_UNICODE_STRING with a non-zero length + referent, then a
+    // maliciously large `actual` in the deferred WSTR header, then a truncated body.
+    // Both decode_query_info_class and decode_enum_key must return Err(Protocol)
+    // instead of `Vec::<u16>::with_capacity(0xFFFF_FFFF)` → ~8 GB alloc / abort.
+    fn hostile_ustr_reply(hostile_actual: u32) -> Vec<u8> {
+        let mut r = Vec::new();
+        r.extend_from_slice(&2u16.to_le_bytes()); // Length (non-zero — get past early return)
+        r.extend_from_slice(&2u16.to_le_bytes()); // MaximumLength
+        r.extend_from_slice(&0x2_0000u32.to_le_bytes()); // Buffer referent (non-null)
+        r.extend_from_slice(&hostile_actual.to_le_bytes()); // max_count
+        r.extend_from_slice(&0u32.to_le_bytes()); // offset
+        r.extend_from_slice(&hostile_actual.to_le_bytes()); // actual_count
+                                                            // (no body follows — server truncates here)
+        r
+    }
+
+    #[test]
+    fn query_info_class_actual_is_bounded_against_stub() {
+        let stub = hostile_ustr_reply(0xFFFF_FFFF);
+        let err = decode_query_info_class(&stub).unwrap_err();
+        assert!(
+            matches!(err, RpcError::Protocol(ref s) if s.contains("actual=")),
+            "expected Protocol(actual …), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn enum_key_actual_is_bounded_against_stub() {
+        // decode_enum_key sniffs the last 4 bytes for the win32 return; ret==0 lets us reach
+        // the parse. Append a trailing 0u32 after our hostile ustr so the tail sniff sees 0.
+        let mut stub = hostile_ustr_reply(0xFFFF_FFFF);
+        stub.extend_from_slice(&0u32.to_le_bytes());
+        let err = decode_enum_key(&stub).unwrap_err();
+        assert!(
+            matches!(err, RpcError::Protocol(ref s) if s.contains("actual=")),
+            "expected Protocol(actual …), got {err:?}"
+        );
     }
 }

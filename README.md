@@ -103,9 +103,10 @@ destructive path (adhammer's `attack zerologon` after user confirmation), see
 | `rprn`     | `12345678-1234-abcd-ef00-0123456789ab` | Print System (SpoolSs) — PrinterBug coercion |
 | `icpr`     | `91ae6020-9e3c-11cf-8d7c-00aa00c091be` | AD CS enrollment (`CertServerRequest`) — ESC1 |
 | `srvsvc`   | `4b324fc8-1670-01d3-1278-5a47bf6ee188` | Session enum, share enum |
+| `wkssvc`   | `6bffd098-a112-3610-9833-46c3f87e345a` | WKST — `NetrWkstaUserEnum` logged-on users (level 1; requires local admin) |
 | `fsrvp`    | `a8e0653c-2744-4389-a61d-7373df8b2292` | File Server Remote VSS Protocol — snapshot creation |
 | `dfsnm`    | `4fc742e0-4a10-11cf-8273-00aa004ae673` | DFS namespace management |
-| `rrp`      | `338cd001-2244-31f1-aaaa-900038001003` | Windows Remote Registry — ADCS ESC6/7/10/11/16 detection |
+| `rrp`      | `338cd001-2244-31f1-aaaa-900038001003` | Windows Remote Registry — ADCS ESC6/7/10/11/16 detection; `logged_on_sids()` via HKU |
 | `netlogon` | `12345678-1234-abcd-ef00-01234567cffb` | Zerologon safe-detect + destructive writers |
 | `dcom` / `dcom_wmi` | `4d9f4ab8-7d1c-11cf-861e-0020af6e7c57` (OXID) + WMI | DCOM activation → OXID resolve → `IWbemServices::ExecMethod Win32_Process.Create` |
 

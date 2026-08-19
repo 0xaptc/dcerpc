@@ -14,7 +14,7 @@ keywords = ["dcerpc", "msrpc", "ndr", "samr", "windows"]
 categories = ["network-programming", "parser-implementations", "os::windows-apis", "authentication"]
 
 [dependencies]
-ms-ndr = { path = "../ms-ndr", version = "0.1" }
+ms-ndr = { path = "../ms-ndr" }
 ntlmssp = "0.1"
 smb2-client = "0.2"
 windows-sddl = "0.1"

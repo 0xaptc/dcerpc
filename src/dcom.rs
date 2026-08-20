@@ -37,8 +37,8 @@ pub fn orpc_this(cid: &[u8; 16]) -> Vec<u8> {
     orpc_this_flags(cid, 1)
 }
 
-/// ORPCTHIS with an explicit `flags` word: impacket sets 1 on the activation call
-/// (`RemoteCreateInstance`) but 0 on ordinary ORPC method calls (NTLMLogin, ExecMethod, …).
+/// ORPCTHIS with an explicit `flags` word: 1 on the activation call
+/// (`RemoteCreateInstance`), 0 on ordinary ORPC method calls (NTLMLogin, ExecMethod, …).
 pub fn orpc_this_flags(cid: &[u8; 16], flags: u32) -> Vec<u8> {
     let mut e = NdrEncoder::new();
     e.u16(COMVERSION_MAJOR);

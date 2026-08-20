@@ -16,9 +16,9 @@
 //! **STATUS (live against a Windows DC):** Stage 1 is COMPLETE — the sealed NTLM bind to
 //! ISystemActivator, `RemoteCreateInstance` (opnum 4), and the activation blob all succeed:
 //! `HRESULT = 0` and the SCM returns a STDOBJREF for the `IWbemLevel1Login` object. The earlier
-//! `E_FAIL (0x80004005)` was resolved by byte-diffing the activation blob against impacket's
-//! (`examples/wmi_probe.rs` reproduces the live probe). The fixes: send exactly the four properties
-//! impacket sends (InstantiationInfo, ActivationContextInfo, ServerLocation, ScmRequest — not six,
+//! `E_FAIL (0x80004005)` was resolved by byte-diffing the activation blob against a captured
+//! accepted blob (`examples/wmi_probe.rs` reproduces the live probe). The fixes: send exactly
+//! the four required properties (InstantiationInfo, ActivationContextInfo, ServerLocation, ScmRequest — not six,
 //! and ServerLocation's CLSID is `…a4`, not `…a6`); `classCtx`/`ClientImpLevel` left 0; the type-ser
 //! `ObjectBufferLength` is the *unpadded* body with 0xFA inter-property alignment; PrivateHeader
 //! filler 0xcccccccc; `dwSize` excludes the leading 8 bytes; `ObjectReferenceSize = len+8`; and the
@@ -61,12 +61,12 @@ fn pickle_header(body_len: usize) -> [u8; 16] {
     h[3] = 0x00;
     h[4..8].copy_from_slice(&0xcccc_ccccu32.to_le_bytes()); // CommonTypeHeader filler
     h[8..12].copy_from_slice(&(body_len as u32).to_le_bytes()); // ObjectBufferLength
-    h[12..16].copy_from_slice(&0xcccc_ccccu32.to_le_bytes()); // PrivateHeader filler (impacket uses 0xcc)
+    h[12..16].copy_from_slice(&0xcccc_ccccu32.to_le_bytes()); // PrivateHeader filler (observed constant 0xcc)
     h
 }
 
 /// Wrap a struct body in its type-serialization pickle (16-byte header + body). `ObjectBufferLength`
-/// is the *unpadded* body length (matching MS-DCOM/impacket); any 8-byte alignment between properties
+/// is the *unpadded* body length (per MS-DCOM); any 8-byte alignment between properties
 /// is done by the caller with 0xFA filler, and is NOT counted in this header.
 fn pickle(body: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(16 + body.len());
@@ -79,7 +79,7 @@ fn pickle(body: &[u8]) -> Vec<u8> {
 fn instantiation_info(clsid: &str, iids: &[&str]) -> Vec<u8> {
     let mut e = NdrEncoder::new();
     e.uuid(&guid_bytes(clsid)); // classId
-    e.u32(0); // classCtx (impacket leaves this 0 — the SCM applies its own default)
+    e.u32(0); // classCtx (leave 0 — the SCM applies its own default)
     e.u32(0); // actvflags
     e.u32(0); // fIsSurrogate
     e.u32(iids.len() as u32); // cIID
@@ -124,7 +124,7 @@ fn scm_request_info() -> Vec<u8> {
     e.null_ptr(); // pdwReserved
     e.referent(); // remoteRequest (customREMOTE_REQUEST_SCM_INFO*, non-null)
                   // customREMOTE_REQUEST_SCM_INFO:
-    e.u32(0); // ClientImpLevel (impacket leaves this 0)
+    e.u32(0); // ClientImpLevel (leave 0)
     e.u16(1); // cRequestedProtseqs
     e.u16(0); // pad
     e.referent(); // pRequestedProtseqs (unique ptr → conformant array)
@@ -136,7 +136,7 @@ fn scm_request_info() -> Vec<u8> {
 /// Assemble the full activation-properties `OBJREF_CUSTOM` (MInterfacePointer bytes) for a
 /// `RemoteCreateInstance` of `clsid` requesting `iids`.
 fn activation_properties_in(clsid: &str, iids: &[&str]) -> Vec<u8> {
-    // Exactly the four properties impacket sends, in this order — Special/Security are omitted (a
+    // Exactly the four required properties, in this order — Special/Security are omitted (a
     // remote SCM rejects the extra/misordered set with E_FAIL). Each property blob is padded to an
     // 8-byte boundary with 0xFA filler *outside* its pickle, and pSizes records the padded length.
     let props: [(&str, Vec<u8>); 4] = [
@@ -192,7 +192,7 @@ fn activation_properties_in(clsid: &str, iids: &[&str]) -> Vec<u8> {
     custom_header[16..20].copy_from_slice(&total_size.to_le_bytes());
     custom_header[20..24].copy_from_slice(&header_size.to_le_bytes());
 
-    // dwSize counts CustomHeader + properties only (NOT the leading dwSize/dwReserved), per impacket.
+    // dwSize counts CustomHeader + properties only (NOT the leading dwSize/dwReserved), per MS-DCOM.
     let mut blob = Vec::new();
     let dw_size = custom_header.len() + props_bytes.len();
     blob.extend_from_slice(&(dw_size as u32).to_le_bytes()); // dwSize
@@ -218,7 +218,7 @@ fn objref_custom(clsid: &str, iid: &str, object_data: &[u8]) -> Vec<u8> {
     o.extend_from_slice(&guid_bytes(iid)); // iid
     o.extend_from_slice(&guid_bytes(clsid)); // OBJREF_CUSTOM.clsid
     o.extend_from_slice(&0u32.to_le_bytes()); // cbExtension
-                                              // impacket sets ObjectReferenceSize = len(pObjectData) + 8 (the extra 8 covers the leading
+                                              // ObjectReferenceSize = len(pObjectData) + 8 (the extra 8 covers the leading
                                               // dwSize/dwReserved the SCM expects to skip); a plain length yields E_FAIL.
     o.extend_from_slice(&((object_data.len() + 8) as u32).to_le_bytes()); // ObjectReferenceSize
     o.extend_from_slice(object_data); // pObjectData
@@ -498,7 +498,7 @@ pub async fn wmi_connect(
 // instance heap). Rather than a full WMIO encoder, we template a captured known-good
 // `Win32_Process.Create` blob: the class definition is fixed; only the CommandLine (in the instance
 // heap, at the tail) varies. Swapping the command means re-patching the seven length fields that span
-// it — validated by byte-diffing adhammer's blob against impacket's for identical commands.
+// it — validated by byte-diffing this crate's blob against a known-good captured blob for identical commands.
 const EXEC_TEMPLATE: &[u8] = include_bytes!("wmi_exec_template.bin");
 const EXEC_CMD_OFF: usize = 1850; // start of the CommandLine UTF-16LE bytes in the template
 const EXEC_CMD_LEN: usize = 82; // template CommandLine length in bytes (41 chars × 2)
@@ -517,7 +517,7 @@ fn patch_len(buf: &mut [u8], off: usize, delta: i64) {
 /// `IWbemServices::ExecMethod` (opnum 24) stub for `Win32_Process.Create <command>`, built by
 /// templating the captured blob: fresh ORPCTHIS, the CommandLine spliced in, and every length field
 /// spanning it adjusted by the byte delta.
-/// Debug helper: the ExecMethod stub for `command` with a fixed CID (for byte-diffing vs impacket).
+/// Debug helper: the ExecMethod stub for `command` with a fixed CID (for byte-diffing vs a reference blob).
 pub fn exec_method_stub_dump(command: &str) -> Vec<u8> {
     exec_method_stub(&[0x5Au8; 16], command)
 }
@@ -587,9 +587,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wmi_activation_stub_matches_impacket() {
+    fn wmi_activation_stub_matches_reference_blob() {
         // Regression: the WMI RemoteCreateInstance stub is byte-identical (modulo NDR referent-id
-        // values + alignment fill) to the impacket blob a live DC accepts with HRESULT 0. Locks in
+        // values + alignment fill) to a reference blob a live DC accepts with HRESULT 0. Locks in
         // the E_FAIL fix — 464 bytes, ORPCTHIS flags=1, four activation properties (cIfs=4).
         let cid = [0x5Au8; 16];
         let stub = remote_create_instance_stub(

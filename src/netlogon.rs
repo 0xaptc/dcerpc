@@ -274,7 +274,7 @@ pub enum Zerologon {
 }
 
 /// Safe Zerologon detection: bind Netlogon over ncacn_ip_tcp and try the all-zero
-/// challenge/credential handshake up to `max_attempts` (impacket uses 2000; success is expected
+/// challenge/credential handshake up to `max_attempts` (default 2000; success is expected
 /// within ~256 on a vulnerable DC). Returns as soon as one attempt succeeds. Never resets the
 /// machine password.
 pub async fn detect_zerologon(host: &str, netbios: &str, max_attempts: u32) -> Result<Zerologon> {

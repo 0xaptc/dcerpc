@@ -1,7 +1,7 @@
 //! SRVSVC (MS-SRVS) — `NetrSessionEnum` over the `\srvsvc` named pipe.
 //!
 //! Enumerates the logon sessions a host sees: for each, the client computer and the user. This
-//! is the session-hunting primitive (BloodHound `HasSession`) — it locates where privileged
+//! is the session-hunting primitive — it locates where privileged
 //! users are logged on so the attacker knows which host to compromise to steal their credentials.
 //!
 //! Rides the same SMB DCE/RPC transport as SAMR/LSAT. Level 10 (`SESSION_INFO_10`) is the least
@@ -33,7 +33,7 @@ pub struct Session {
 }
 
 /// Marshal a `NetrSessionEnum(ServerName=NULL, ClientName=NULL, UserName=NULL, Level=10)` request.
-/// `ServerName` NULL lets the server infer itself (matches impacket's `hNetrSessionEnum`).
+/// `ServerName` NULL lets the server infer itself (per MS-SRVS `NetrSessionEnum` IDL).
 pub fn encode_session_enum() -> Vec<u8> {
     let mut e = NdrEncoder::new();
     e.null_ptr(); // ServerName  [in,string,unique] = NULL

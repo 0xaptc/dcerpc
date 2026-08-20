@@ -3,8 +3,8 @@
 //! authenticated `\PIPE\atsvc` SMB transport like SAMR/SVCCTL. An alternative to the SVCCTL exec
 //! (different telemetry — 4698 task-created vs 4697 service-installed).
 //!
-//! STATUS: `encode_register` is verified byte-for-byte against impacket's
-//! `SchRpcRegisterTask.getData()` (only NDR pad-filler bytes differ, which the server ignores),
+//! STATUS: `encode_register` is verified byte-for-byte against the MS-TSCH
+//! `SchRpcRegisterTask` NDR IDL (only NDR pad-filler bytes differ, which the server ignores),
 //! and the sealed bind is accepted. `SchRpcRegisterTask` still returns `nca_s_fault_ndr` (0x6f7)
 //! against the Server 2025 lab over the sealed pipe — an unresolved transport subtlety that would
 //! need a wire capture of a working atexec to pin. RCE is already covered by `attack exec`
@@ -64,7 +64,7 @@ fn task_xml(command: &str) -> String {
 fn encode_register(path: &str, xml: &str) -> Vec<u8> {
     let mut e = NdrEncoder::new();
     // path is LPWSTR (unique pointer → referent + WSTR); xml is a mandatory WSTR (embedded,
-    // no referent), per the MS-TSCH IDL as modeled by impacket.
+    // no referent), per the MS-TSCH IDL.
     e.referent();
     e.conformant_varying_wstr(path);
     e.align(4);

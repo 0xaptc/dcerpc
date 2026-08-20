@@ -5,7 +5,7 @@
 //!
 //! LIVE-VALIDATED vs Server 2025 AD CS: `CertServerRequest` over the sealed `\cert` pipe issues
 //! a real certificate (the built-in `User` template issued a `CN=recon` cert signed by the
-//! `corp-CA`). The stub layout matches impacket's `CertServerRequest.getData()` byte-for-byte
+//! `corp-CA`). The stub layout matches the MS-ICPR `CertServerRequest` NDR wire format byte-for-byte
 //! (every pointee inline after its referent), and large responses are drained across multiple
 //! sealed pipe fragments. ESC1 impersonation additionally needs an enrollee-supplies-subject
 //! template published on the CA.
@@ -81,7 +81,7 @@ pub fn decode_cert_server_response(stub: &[u8]) -> Result<EnrollResult> {
 /// + inline WSTR); each CERTTRANSBLOB is a [ref] struct {cb, [unique] pb} with the byte array
 /// deferred after both fixed parts.
 fn encode_request(authority: &str, attribs: &[u8], request: &[u8]) -> Vec<u8> {
-    // Layout mirrors impacket's NDRCALL byte-for-byte: each pointer's pointee is marshaled
+    // Layout mirrors the MS-ICPR NDRCALL byte-for-byte: each pointer's pointee is marshaled
     // INLINE right after its referent (not deferred), in field order.
     let mut e = NdrEncoder::new();
     e.u32(0); // dwFlags
@@ -169,15 +169,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_stub_matches_impacket_layout() {
-        // Byte-length + key fields verified against impacket's CertServerRequest.getData()
+    fn request_stub_matches_ms_icpr_layout() {
+        // Byte-length + key fields verified against the MS-ICPR CertServerRequest wire format
         // for the same inputs (10-char authority, 58-byte attribs, 20-byte request → 152).
         let s = encode_request(
             "corp-CA-01",
             &utf16z("CertificateTemplate:VulnUser"),
             &(0..20).collect::<Vec<u8>>(),
         );
-        assert_eq!(s.len(), 152, "stub length must match impacket");
+        assert_eq!(s.len(), 152, "stub length must match the MS-ICPR wire format");
         assert_eq!(u32::from_le_bytes(s[0..4].try_into().unwrap()), 0); // dwFlags
         assert_ne!(u32::from_le_bytes(s[4..8].try_into().unwrap()), 0); // authority referent
         assert_eq!(u32::from_le_bytes(s[8..12].try_into().unwrap()), 11); // authority max_count = 11

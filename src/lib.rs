@@ -1,4 +1,4 @@
-//! A minimal DCE/RPC (MS-RPCE) stack in Rust — the impacket `dcerpc.v5` equivalent.
+//! A minimal DCE/RPC (MS-RPCE) stack in Rust.
 //!
 //! Layers, bottom-up:
 //!   `ndr`       — NDR (Network Data Representation) transfer-syntax marshaling.

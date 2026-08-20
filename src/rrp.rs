@@ -372,7 +372,7 @@ impl<'a> RegistryClient<'a> {
     /// Open a subkey with `REG_OPTION_BACKUP_RESTORE` (dwOptions=4) — the flag that tells
     /// the remote registry to honor `SeBackupPrivilege` on protected hives (`SAM`, `SECURITY`).
     /// A DA-level session's token has SeBackupPrivilege granted; this flag turns "denied"
-    /// on `HKLM\SAM\…` into a successful read. Matches impacket-secretsdump's approach.
+    /// on `HKLM\SAM\…` into a successful read — the standard SeBackupPrivilege path.
     pub async fn open_backup(&mut self, parent: &Hkey, subkey: &str) -> Result<Hkey> {
         let resp = self
             .pipe
@@ -430,7 +430,7 @@ impl<'a> RegistryClient<'a> {
 
     /// `BaseRegQueryInfoKey` — return the key's *class name* (the field the SAM bootkey lives
     /// in: 8 hex chars each in the class of `HKLM\SYSTEM\…\Lsa\{JD,Skew1,GBG,Data}`). Other
-    /// fields the opnum returns are ignored — impacket-secretsdump's SYSTEM-only path also
+    /// fields the opnum returns are ignored — the SYSTEM-only bootkey extraction path also
     /// uses this exact primitive.
     pub async fn query_info_class(&mut self, key: &Hkey) -> Result<String> {
         let resp = self
@@ -510,9 +510,9 @@ pub fn decode_query_info_class(stub: &[u8]) -> Result<String> {
 
 /// Encode `BaseRegEnumKey(hKey, dwIndex, lpNameIn={empty,max=1024}, lpClassIn=64-spaces)`.
 ///
-/// Matches impacket's `hBaseRegEnumKey` byte-for-byte: `lpNameIn` is an EMPTY RRP_UNICODE_STRING
+/// Matches the MS-RRP `BaseRegEnumKey` IDL byte-for-byte: `lpNameIn` is an EMPTY RRP_UNICODE_STRING
 /// with MaximumLength=1024 (so the server can write up to 512 wchars into its buffer), and
-/// `lpClassIn` is `' ' * 64` — impacket's exact placeholder. Sending an "empty pointer" for
+/// `lpClassIn` is `' ' * 64` — the observed accepted placeholder. Sending an "empty pointer" for
 /// `lpClassIn` gets `nca_s_fault_ndr` on Server 2016+; a real 64-char string is what the
 /// server's stub expects.
 fn encode_enum_key(key: &Hkey, dw_index: u32) -> Vec<u8> {
@@ -529,7 +529,7 @@ fn encode_enum_key(key: &Hkey, dw_index: u32) -> Vec<u8> {
     e.u32(0); // offset
     e.u32(0); // actual_count = 0 (empty)
               // lpClassIn [in,unique] → non-null pointer to RRP_UNICODE_STRING("                                                                ")
-              // exactly what impacket does (' ' * 64 = 64 wchars).
+              // (' ' * 64 = 64 wchars).
     e.referent(); // top-level unique pointer referent
     const SPACES: u32 = 64;
     // deferred pointee: RRP_UNICODE_STRING
@@ -538,7 +538,7 @@ fn encode_enum_key(key: &Hkey, dw_index: u32) -> Vec<u8> {
     e.referent(); // Buffer
     e.u32(SPACES + 1); // max_count = 65 wchars (spaces + NUL)
     e.u32(0);
-    e.u32(SPACES); // actual_count = 64 (the 64 spaces impacket sends)
+    e.u32(SPACES); // actual_count = 64 (the 64 spaces sent)
     for _ in 0..SPACES {
         e.u16(0x20); // ' '
     }

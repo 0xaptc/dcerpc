@@ -69,7 +69,20 @@ pub fn decode_wksta_user_enum(stub: &[u8]) -> Result<(Vec<WkstaUser>, u32, u32)>
         let buffer_ref = d.u32()?;
         if buffer_ref != 0 {
             let _max = d.u32()?; // conformant max_count
-                                 // Fixed parts: EntriesRead × 4 string pointers.
+                                 // Fixed parts: EntriesRead × 4 string pointers — 16 wire bytes per entry.
+                                 // Bound `entries_read` (attacker-controlled u32) against the remaining stub
+                                 // before `Vec::with_capacity` so a hostile server sending
+                                 // `entries_read = 0xFFFFFFFF` + a truncated tail can't force a multi-GB
+                                 // allocation that aborts via `handle_alloc_error`. Same pattern as the
+                                 // rrp.rs sibling sites and srvsvc.rs — see CLAUDE.md "Bounded-alloc pattern".
+            if entries_read
+                .checked_mul(16)
+                .map_or(true, |need| need > d.remaining())
+            {
+                return Err(crate::RpcError::Protocol(format!(
+                    "NetrWkstaUserEnum: EntriesRead={entries_read} exceeds remaining stub"
+                )));
+            }
             let mut refs = Vec::with_capacity(entries_read);
             for _ in 0..entries_read {
                 let user_ref = d.u32()?;
@@ -214,11 +227,27 @@ mod tests {
     #[test]
     fn empty_reply_is_not_a_panic() {
         for cut in 0..24 {
-            // Truncated replies must not panic — Err is the correct outcome.
-            assert!(
-                decode_wksta_user_enum(&vec![0u8; cut]).is_err()
-                    || decode_wksta_user_enum(&vec![0u8; cut]).is_ok()
-            );
+            let _ = decode_wksta_user_enum(&vec![0u8; cut]);
         }
+    }
+
+    // Hostile server: valid header + non-null container + non-null buffer, then a
+    // maliciously large EntriesRead + truncated body. Must return Err(Protocol) —
+    // NOT `Vec::with_capacity(0xFFFFFFFF)` → ~64 GB alloc / handle_alloc_error abort.
+    #[test]
+    fn entries_read_is_bounded_against_stub() {
+        let mut r = Vec::new();
+        r.extend_from_slice(&1u32.to_le_bytes()); // Level
+        r.extend_from_slice(&1u32.to_le_bytes()); // union tag
+        r.extend_from_slice(&0x2_0000u32.to_le_bytes()); // container ref
+        r.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // EntriesRead = u32::MAX
+        r.extend_from_slice(&0x2_0004u32.to_le_bytes()); // Buffer ref
+        r.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // conformant max_count
+                                                            // (server truncates here)
+        let err = decode_wksta_user_enum(&r).unwrap_err();
+        assert!(
+            matches!(err, crate::RpcError::Protocol(ref s) if s.contains("EntriesRead")),
+            "expected Protocol(EntriesRead …), got {err:?}"
+        );
     }
 }

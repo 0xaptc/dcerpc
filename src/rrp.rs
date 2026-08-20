@@ -169,7 +169,8 @@ fn encode_close(hkey: &Hkey) -> Vec<u8> {
 
 /// Parse the BaseRegQueryValue reply: [out] lpType, lpData (conformant-varying byte array),
 /// lpcbData, lpcbLen, then the Win32 return. Returns the value's type + bytes.
-fn decode_query_value(stub: &[u8]) -> Result<RegValue> {
+#[doc(hidden)]
+pub fn decode_query_value(stub: &[u8]) -> Result<RegValue> {
     let mut d = NdrDecoder::new(stub);
     // lpType (unique)
     let mut ty = 0u32;
@@ -472,7 +473,8 @@ fn encode_query_info_key(key: &Hkey) -> Vec<u8> {
 /// Decode `BaseRegQueryInfoKey`: consume up to lpClassOut and return its UTF-16LE text.
 /// The rest of the reply (subkey/value counts, last-write time, HRESULT) is discarded — we
 /// only care about the class name here.
-fn decode_query_info_class(stub: &[u8]) -> Result<String> {
+#[doc(hidden)]
+pub fn decode_query_info_class(stub: &[u8]) -> Result<String> {
     let mut d = NdrDecoder::new(stub);
     // lpClassOut: RRP_UNICODE_STRING { Length, MaximumLength, Buffer[unique] } then deferred
     // WSTR buffer if referent != 0. Length is the used bytes (NUL included).
@@ -548,7 +550,8 @@ fn encode_enum_key(key: &Hkey, dw_index: u32) -> Vec<u8> {
 /// Decode `BaseRegEnumKey`: pull out the returned subkey name.
 /// Returns `Ok(None)` if the server signalled `STATUS_NO_MORE_ITEMS` (0x00000103) at the
 /// tail — the normal end-of-enumeration marker.
-fn decode_enum_key(stub: &[u8]) -> Result<Option<String>> {
+#[doc(hidden)]
+pub fn decode_enum_key(stub: &[u8]) -> Result<Option<String>> {
     if stub.len() < 4 {
         return Ok(None);
     }

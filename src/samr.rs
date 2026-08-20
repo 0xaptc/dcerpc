@@ -77,6 +77,20 @@ pub fn decode_enum_domains(stub: &[u8]) -> Result<(u32, Vec<(u32, String)>)> {
     let _array_ref = d.u32()?;
     let _max_count = d.u32()?;
 
+    // Bounded-alloc preflight: each SAMPR_RID_ENUMERATION entry is a `u32` RID
+    // + a 4-byte RPC_UNICODE_STRING header (Length u16 + MaxLength u16) + a
+    // `u32` Buffer referent = **12 wire bytes minimum** per entry. Cap the
+    // reservation against remaining stub before `Vec::with_capacity`.
+    // Found by dcerpc-fuzz/samr_enum_domains crash-c3650323eef8c208f56….
+    if entries
+        .checked_mul(12)
+        .map_or(true, |need| need > d.remaining())
+    {
+        return Err(RpcError::Protocol(format!(
+            "SamrEnumerateDomainsInSamServer: EntriesRead={entries} exceeds remaining stub"
+        )));
+    }
+
     let mut fixed = Vec::with_capacity(entries);
     for _ in 0..entries {
         let rid = d.u32()?;
@@ -367,5 +381,22 @@ mod tests {
         let stub = encode_enum_users(&SamrHandle([0; 20]), 0, 0, 0x1000);
         assert_eq!(stub.len(), 20 + 4 + 4 + 4);
         assert_eq!(&stub[28..32], &0x1000u32.to_le_bytes());
+    }
+
+    // Regression: hostile server sends EnumContext=0, Buffer_ref=non-null,
+    // EntriesRead=u32::MAX + truncated tail. Pre-fix: Vec::with_capacity(u32::MAX)
+    // → OOM abort. Post-fix: Err(Protocol) with "EntriesRead=… exceeds remaining stub".
+    // Discovered by dcerpc-fuzz/samr_enum_domains crash-c3650323eef8c208f56….
+    #[test]
+    fn enum_domains_entries_is_bounded_against_stub() {
+        let hostile: [u8; 24] = [
+            0, 0, 0, 0, 0, 0, 2, 0, 0xff, 0xff, 0xff, 0xff, 4, 0, 2, 0, 0xff, 0xff, 0xff, 0xff, 0,
+            0, 0, 0,
+        ];
+        let err = decode_enum_domains(&hostile).unwrap_err();
+        assert!(
+            matches!(err, RpcError::Protocol(ref s) if s.contains("EntriesRead=")),
+            "expected Protocol(EntriesRead …), got {err:?}"
+        );
     }
 }

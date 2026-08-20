@@ -13,12 +13,60 @@ libfuzzer-sys = "0.4"
 [dependencies.dcerpc]
 path = ".."
 
-# Fuzz targets — one per top-level reply decoder. Add new bins here as coverage
-# grows across `wkssvc`, `rrp`, `samr`, `lsat`, `netlogon`, `svcctl`, `tsch`,
-# and the `drsuapi` reply parser once it's extracted from `ms-drsr`.
+# One fuzz target per top-level reply decoder. See `fuzz/README.md`.
+
 [[bin]]
 name = "srvsvc_decode"
 path = "fuzz_targets/srvsvc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wkssvc_decode"
+path = "fuzz_targets/wkssvc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "samr_enum_domains"
+path = "fuzz_targets/samr_enum_domains.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "samr_lookup_domain"
+path = "fuzz_targets/samr_lookup_domain.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lsat_lookup_names"
+path = "fuzz_targets/lsat_lookup_names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rrp_query_value"
+path = "fuzz_targets/rrp_query_value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rrp_query_info_class"
+path = "fuzz_targets/rrp_query_info_class.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rrp_enum_key"
+path = "fuzz_targets/rrp_enum_key.rs"
 test = false
 doc = false
 bench = false

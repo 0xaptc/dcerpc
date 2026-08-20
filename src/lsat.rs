@@ -96,6 +96,17 @@ pub fn decode_lookup_names(stub: &[u8]) -> Result<Option<Sid>> {
         let _max_entries = d.u32()?;
         if domains_ref != 0 {
             let _max = d.u32()?;
+            // Bounded-alloc preflight: each LSAPR_TRUST_INFORMATION is
+            // Length u16 + MaxLength u16 + Buffer u32 + Sid u32 = 12 wire bytes.
+            // Found by dcerpc-fuzz/lsat_lookup_names crash-493e16c38e61b25f….
+            if entries
+                .checked_mul(12)
+                .map_or(true, |need| need > d.remaining())
+            {
+                return Err(crate::RpcError::Protocol(format!(
+                    "LsarLookupNames: Entries={entries} exceeds remaining stub"
+                )));
+            }
             // fixed parts: each LSAPR_TRUST_INFORMATION { Name{len,maxlen,buf-ptr}, Sid-ptr }
             let mut fixed = Vec::with_capacity(entries);
             for _ in 0..entries {
@@ -194,5 +205,25 @@ mod tests {
     fn lookup_names_marshals_count_and_name() {
         let stub = encode_lookup_names(&SamrHandle([0; 20]), "Administrator");
         assert_eq!(u32::from_le_bytes(stub[20..24].try_into().unwrap()), 1); // Count
+    }
+
+    // Regression: hostile LSAPR_REFERENCED_DOMAIN_LIST claiming Entries=u32::MAX
+    // + non-null domains_ref + truncated tail. Pre-fix: Vec::with_capacity(u32::MAX)
+    // → OOM abort. Post-fix: Err(Protocol) with "Entries=… exceeds remaining stub".
+    // Discovered by dcerpc-fuzz/lsat_lookup_names.
+    #[test]
+    fn lookup_names_entries_is_bounded_against_stub() {
+        let mut r = Vec::new();
+        r.extend_from_slice(&0x2_0000u32.to_le_bytes()); // dom_ref
+        r.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // entries = u32::MAX
+        r.extend_from_slice(&0x2_0004u32.to_le_bytes()); // domains_ref (non-null → hit the guard)
+        r.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // _max_entries
+        r.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // _max (conformant)
+                                                            // truncated — no per-entry bytes follow
+        let err = decode_lookup_names(&r).unwrap_err();
+        assert!(
+            matches!(err, crate::RpcError::Protocol(ref s) if s.contains("Entries=")),
+            "expected Protocol(Entries …), got {err:?}"
+        );
     }
 }

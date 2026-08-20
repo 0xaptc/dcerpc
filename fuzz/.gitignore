@@ -1,0 +1,7 @@
+target
+corpus/*/[!v]*
+!corpus/*/valid-*
+!corpus/*/empty.bin
+!corpus/*/hostile-*
+artifacts/
+coverage/

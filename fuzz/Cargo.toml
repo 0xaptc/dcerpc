@@ -1,0 +1,24 @@
+[package]
+name = "dcerpc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.dcerpc]
+path = ".."
+
+# Fuzz targets — one per top-level reply decoder. Add new bins here as coverage
+# grows across `wkssvc`, `rrp`, `samr`, `lsat`, `netlogon`, `svcctl`, `tsch`,
+# and the `drsuapi` reply parser once it's extracted from `ms-drsr`.
+[[bin]]
+name = "srvsvc_decode"
+path = "fuzz_targets/srvsvc_decode.rs"
+test = false
+doc = false
+bench = false

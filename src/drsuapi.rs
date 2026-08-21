@@ -307,6 +307,17 @@ fn parse_repl_object(reply: &[u8]) -> Result<(u32, Vec<u8>, Vec<u8>)> {
     skip_dsname(&mut d)?;
     // --- deferred: prefix table (count entries, then each OID's byte array) ---
     let ptmc = d.u32()?;
+    // Bounded-alloc preflight — a hostile DC can return `ptmc = 0xFFFFFFFF`,
+    // triggering a 48 GiB `Vec::with_capacity` before the loop body errors.
+    // Each prefix-table entry is 3 × u32 = 12 bytes on the wire.
+    if (ptmc as usize)
+        .checked_mul(12)
+        .map_or(true, |need| need > d.remaining())
+    {
+        return Err(RpcError::Protocol(format!(
+            "DRSUAPI GetNCChanges: prefix-table count={ptmc} exceeds remaining stub"
+        )));
+    }
     let mut oid_lens = Vec::with_capacity(ptmc as usize);
     for _ in 0..ptmc {
         d.u32()?; // ndx
@@ -337,6 +348,15 @@ fn parse_repl_object(reply: &[u8]) -> Result<(u32, Vec<u8>, Vec<u8>)> {
 
     // ATTR array (conformant): max_count then attr_count × (attrTyp, valCount, pAVal ref)
     let amc = d.u32()?;
+    // Bounded-alloc preflight — each ATTRBLOCK triple is 3 × u32 = 12 bytes.
+    if (amc as usize)
+        .checked_mul(12)
+        .map_or(true, |need| need > d.remaining())
+    {
+        return Err(RpcError::Protocol(format!(
+            "DRSUAPI GetNCChanges: attr-block count={amc} exceeds remaining stub"
+        )));
+    }
     let mut triples = Vec::with_capacity(amc as usize);
     for _ in 0..amc {
         let at = d.u32()?;
@@ -354,6 +374,16 @@ fn parse_repl_object(reply: &[u8]) -> Result<(u32, Vec<u8>, Vec<u8>)> {
             continue;
         }
         let vmc = d.u32()?;
+        // Bounded-alloc preflight — each value pointer is 2 × u32 = 8 bytes
+        // (valLen + pVal).
+        if (vmc as usize)
+            .checked_mul(8)
+            .map_or(true, |need| need > d.remaining())
+        {
+            return Err(RpcError::Protocol(format!(
+                "DRSUAPI GetNCChanges: value count={vmc} exceeds remaining stub"
+            )));
+        }
         let mut vptrs = Vec::with_capacity(vmc as usize);
         for _ in 0..vmc {
             d.u32()?; // valLen
@@ -393,6 +423,12 @@ fn skip_dsname(d: &mut NdrDecoder) -> Result<()> {
 }
 
 /// Consume a DSNAME and return the RID from its embedded SID (last sub-authority).
+///
+/// `sid` is the fixed 28-byte SID blob per MS-DRSR. Its layout is:
+///   `Revision(1) + SubAuthorityCount(1) + IdentifierAuthority(6) + SubAuthority[0..5](u32×n)`.
+/// A well-formed SID has `SubAuthorityCount` in `1..=5`; anything else means either the
+/// caller passed a truncated blob or a hostile DC returned garbage. Both cases previously
+/// panicked via unchecked slice indexing + `.try_into().unwrap()`.
 fn read_dsname_rid(d: &mut NdrDecoder) -> Result<u32> {
     let mc = d.u32()?;
     d.u32()?; // structLen
@@ -402,12 +438,92 @@ fn read_dsname_rid(d: &mut NdrDecoder) -> Result<u32> {
     d.u32()?; // NameLen
     d.read_bytes(mc as usize * 2)?;
     d.align(4);
-    if sid_len >= 8 {
-        let count = sid[1] as usize;
-        let off = 2 + 6 + (count - 1) * 4;
-        return Ok(u32::from_le_bytes(sid[off..off + 4].try_into().unwrap()));
+    if sid_len < 8 {
+        return Err(RpcError::Protocol("object DSNAME has no SID".into()));
     }
-    Err(RpcError::Protocol("object DSNAME has no SID".into()))
+    let count = *sid
+        .get(1)
+        .ok_or_else(|| RpcError::Protocol("DSNAME SID: SubAuthorityCount byte missing".into()))?
+        as usize;
+    if !(1..=5).contains(&count) {
+        return Err(RpcError::Protocol(format!(
+            "DSNAME SID: SubAuthorityCount={count} out of range 1..=5"
+        )));
+    }
+    // Offset of the last sub-authority = 8 (fixed prefix) + (count - 1) × 4.
+    let off = 8 + (count - 1) * 4;
+    let bytes = sid.get(off..off + 4).ok_or_else(|| {
+        RpcError::Protocol(format!(
+            "DSNAME SID: sub-authority at offset {off} out of bounds (sid.len={})",
+            sid.len()
+        ))
+    })?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod dsname_tests {
+    use super::read_dsname_rid;
+    use crate::ndr::NdrEncoder;
+
+    /// Build a synthetic DSNAME stub around a caller-supplied SID blob.
+    fn dsname_stub(sid_len: u32, sid: &[u8; 28]) -> Vec<u8> {
+        let mut e = NdrEncoder::new();
+        e.u32(1); // StringName max_count
+        e.u32(64); // structLen
+        e.u32(sid_len);
+        e.bytes(&[0u8; 16]); // Guid
+        e.bytes(sid); // fixed 28-byte SID area
+        e.u32(0); // NameLen
+        e.u16(0); // StringName body (mc=1 wchar)
+        e.align(4);
+        e.into_bytes()
+    }
+
+    #[test]
+    fn returns_last_subauthority_for_valid_5_count_sid() {
+        // S-1-5-21-a-b-c-500 → last SubAuthority = 500.
+        let mut sid = [0u8; 28];
+        sid[0] = 1; // Revision
+        sid[1] = 5; // SubAuthorityCount = 5
+        sid[7] = 5; // IdentifierAuthority = 5 (last byte of 6)
+        // SubAuthority[0..4]: 21, a, b, c, 500 (LE u32 each)
+        sid[8..12].copy_from_slice(&21u32.to_le_bytes());
+        sid[12..16].copy_from_slice(&11u32.to_le_bytes());
+        sid[16..20].copy_from_slice(&22u32.to_le_bytes());
+        sid[20..24].copy_from_slice(&33u32.to_le_bytes());
+        sid[24..28].copy_from_slice(&500u32.to_le_bytes());
+        let stub = dsname_stub(28, &sid);
+        let mut d = crate::ndr::NdrDecoder::new(&stub);
+        assert_eq!(read_dsname_rid(&mut d).unwrap(), 500);
+    }
+
+    #[test]
+    fn rejects_zero_subauthority_count_without_panic() {
+        // Hostile input: count=0 → the old code did `(0 - 1) * 4` = usize::MAX * 4 and
+        // panicked on the out-of-bounds slice index. Now must return Err.
+        let mut sid = [0u8; 28];
+        sid[0] = 1;
+        sid[1] = 0; // SubAuthorityCount = 0 — hostile
+        let stub = dsname_stub(28, &sid);
+        let mut d = crate::ndr::NdrDecoder::new(&stub);
+        let err = read_dsname_rid(&mut d).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("out of range"), "unexpected err: {msg}");
+    }
+
+    #[test]
+    fn rejects_oversized_subauthority_count_without_panic() {
+        // Hostile: count=255 → offset far past sid.len() = 28.
+        let mut sid = [0u8; 28];
+        sid[0] = 1;
+        sid[1] = 255;
+        let stub = dsname_stub(28, &sid);
+        let mut d = crate::ndr::NdrDecoder::new(&stub);
+        let err = read_dsname_rid(&mut d).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("out of range"), "unexpected err: {msg}");
+    }
 }
 
 // -------------------------------------------------------------------------------------------

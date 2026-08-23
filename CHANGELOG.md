@@ -9,6 +9,36 @@ project adheres to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 Nothing pending.
 
+## [0.3.0] — 2026-08-23 *(committed local, not yet published)*
+
+### Added — WS-4 Kerberos sealed bind, Phase 1 (offline primitives)
+
+- `pdu::RPC_C_AUTHN_GSS_KERBEROS` constant (0x10) and internal
+  `sec_trailer_full(auth_type, auth_level, pad_len)` factoring, so the same
+  sec_trailer builder serves both NTLMSSP and Kerberos paths.
+- `pdu::build_bind_auth_kerberos`, `pdu::build_auth3_kerberos`,
+  `pdu::build_request_sealed_krb` — RPC PDU framers that stamp
+  `auth_type = 0x10` and carry a variable-length auth_value (28 B for
+  AES-CTS-HMAC-SHA1-96 DCE-style vs NTLM's fixed 16 B).
+- `krb_seal` module: RFC 4121 §4.2.6 `WrapToken` header codec (encode +
+  decode with reserved-flag / filler / TOK_ID enforcement) and the
+  `KrbSealer` trait matching `ntlmssp::SealState`'s `seal_pdu` /
+  `unseal_pdu` shape but returning a variable auth_value. Concrete AES-CTS
+  crypto (`DK` + n-fold + `E()` + DCE-style WRAP layout) lives outside this
+  crate — a Kerberos crate holding the TGS session key wires it up via
+  `picky-krb`'s `Aes256CtsHmacSha196` cipher.
+- Hostile-input tests: short header, wrong TOK_ID, reserved flag bits set,
+  bad filler, `u16::MAX` RRC, wrong auth_value length — all rejected
+  without allocation.
+
+### Deferred to WS-4 Phase 2 (follow-up session)
+
+- Live wire: `RpcTcp::bind_sealed_kerberos` /
+  `SmbPipe::bind_sealed_kerberos` + `call_sealed_kerberos` require an
+  operator-held TGT.
+- Concrete `AesCtsHmacSha1KrbSealer` implementation of the trait, wired
+  against a Kerberos crypto crate.
+
 ## [0.2.6] — 2026-08-20 *(committed local, not yet published)*
 
 ### Added

@@ -12,8 +12,13 @@ pub mod ptype {
     pub const AUTH3: u8 = 16;
 }
 
-/// DCE/RPC authentication (MS-RPCE §2.2.2.11): NTLMSSP with packet privacy (sign+seal).
+/// DCE/RPC authentication (MS-RPCE §2.2.2.11).
+///
+/// `RPC_C_AUTHN_WINNT` (NTLMSSP) and `RPC_C_AUTHN_GSS_KERBEROS` (SPNEGO/Kerberos AP-REQ)
+/// are the two SSPs an on-wire dcerpc client currently emits; the level selects auth-only
+/// vs sign+seal.
 pub const RPC_C_AUTHN_WINNT: u8 = 0x0a;
+pub const RPC_C_AUTHN_GSS_KERBEROS: u8 = 0x10;
 pub const RPC_C_AUTHN_LEVEL_PKT_CONNECT: u8 = 0x02;
 pub const RPC_C_AUTHN_LEVEL_PKT_PRIVACY: u8 = 0x06;
 
@@ -50,16 +55,14 @@ fn sec_trailer(auth_pad_length: u8) -> [u8; 8] {
 /// `PKT_CONNECT` (auth-only, no per-message signing/sealing), because the relaying attacker
 /// doesn't hold the victim's NTLM session key and can't produce signatures.
 pub(crate) fn sec_trailer_lvl(auth_pad_length: u8, auth_level: u8) -> [u8; 8] {
-    [
-        RPC_C_AUTHN_WINNT,
-        auth_level,
-        auth_pad_length,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ]
+    sec_trailer_full(RPC_C_AUTHN_WINNT, auth_level, auth_pad_length)
+}
+
+/// `sec_trailer` with explicit auth_type + auth_level — the shared constructor for both the
+/// NTLMSSP and Kerberos (`RPC_C_AUTHN_GSS_KERBEROS`) sealed-bind paths. `auth_context_id`
+/// is a fixed 0 on this stack; Windows accepts any value on the client leg.
+pub(crate) fn sec_trailer_full(auth_type: u8, auth_level: u8, auth_pad_length: u8) -> [u8; 8] {
+    [auth_type, auth_level, auth_pad_length, 0, 0, 0, 0, 0]
 }
 
 fn bind_body(abstract_syntax: Syntax) -> Vec<u8> {
@@ -139,6 +142,43 @@ pub fn build_auth3(call_id: u32, auth_token: &[u8]) -> Vec<u8> {
     let mut pdu = header_auth(ptype::AUTH3, frag_length, auth_token.len() as u16, call_id);
     pdu.extend_from_slice(&[0, 0, 0, 0]);
     pdu.extend_from_slice(&sec_trailer(0));
+    pdu.extend_from_slice(auth_token);
+    pdu
+}
+
+/// BIND carrying a SPNEGO / Kerberos AP-REQ token (auth_type = `RPC_C_AUTHN_GSS_KERBEROS`).
+///
+/// The token itself is the GSS-API `InitialContextToken(SPNEGO → negTokenInit → krb5(AP-REQ))`
+/// blob — built by a Kerberos crate holding the TGS session key. This function only frames it
+/// as an RPC BIND with the given auth level (PKT_PRIVACY for sealed sessions).
+pub fn build_bind_auth_kerberos(
+    call_id: u32,
+    abstract_syntax: Syntax,
+    ap_req_gss_token: &[u8],
+    auth_level: u8,
+) -> Vec<u8> {
+    let body = bind_body(abstract_syntax);
+    let frag_length = (16 + body.len() + 8 + ap_req_gss_token.len()) as u16;
+    let mut pdu = header_auth(
+        ptype::BIND,
+        frag_length,
+        ap_req_gss_token.len() as u16,
+        call_id,
+    );
+    pdu.extend_from_slice(&body);
+    pdu.extend_from_slice(&sec_trailer_full(RPC_C_AUTHN_GSS_KERBEROS, auth_level, 0));
+    pdu.extend_from_slice(ap_req_gss_token);
+    pdu
+}
+
+/// AUTH3 PDU completing a Kerberos bind. Windows normally answers BIND_ACK carrying an
+/// AP-REP (mutual auth) and the client responds with an empty AUTH3 to close the exchange;
+/// pass `&[]` for the empty case, or a follow-up token if one is required.
+pub fn build_auth3_kerberos(call_id: u32, auth_token: &[u8], auth_level: u8) -> Vec<u8> {
+    let frag_length = (16 + 4 + 8 + auth_token.len()) as u16;
+    let mut pdu = header_auth(ptype::AUTH3, frag_length, auth_token.len() as u16, call_id);
+    pdu.extend_from_slice(&[0, 0, 0, 0]);
+    pdu.extend_from_slice(&sec_trailer_full(RPC_C_AUTHN_GSS_KERBEROS, auth_level, 0));
     pdu.extend_from_slice(auth_token);
     pdu
 }
@@ -223,6 +263,42 @@ pub fn build_request_sealed_object(
     pdu.extend_from_slice(&body);
     pdu.extend_from_slice(&sec_trailer(pad_len));
     pdu.extend_from_slice(signature);
+    pdu
+}
+
+/// Build a sign+sealed REQUEST PDU for a Kerberos-authenticated session. Layout matches
+/// [`build_request_sealed`] but the sec_trailer carries `RPC_C_AUTHN_GSS_KERBEROS`, and
+/// `auth_value` is variable-length (28 B for AES-CTS-HMAC-SHA1-96 DCE-style: 16 B WRAP
+/// header + 12 B checksum) rather than NTLM's fixed 16 B.
+pub fn build_request_sealed_krb(
+    call_id: u32,
+    p_cont_id: u16,
+    opnum: u16,
+    sealed_stub: &[u8],
+    pad_len: u8,
+    auth_value: &[u8],
+    alloc_hint: u32,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + sealed_stub.len());
+    body.extend_from_slice(&alloc_hint.to_le_bytes());
+    body.extend_from_slice(&p_cont_id.to_le_bytes());
+    body.extend_from_slice(&opnum.to_le_bytes());
+    body.extend_from_slice(sealed_stub);
+
+    let frag_length = (16 + body.len() + 8 + auth_value.len()) as u16;
+    let mut pdu = header_auth(
+        ptype::REQUEST,
+        frag_length,
+        auth_value.len() as u16,
+        call_id,
+    );
+    pdu.extend_from_slice(&body);
+    pdu.extend_from_slice(&sec_trailer_full(
+        RPC_C_AUTHN_GSS_KERBEROS,
+        RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+        pad_len,
+    ));
+    pdu.extend_from_slice(auth_value);
     pdu
 }
 
@@ -382,6 +458,52 @@ mod tests {
         assert_eq!(s, sealed);
         assert_eq!(g, sig);
         assert_eq!(pad, 0);
+    }
+
+    #[test]
+    fn bind_auth_kerberos_marks_gss_type() {
+        let drs = Syntax::new("e3514235-4b06-11d1-ab04-00c04fc2dcd2", 4, 0);
+        // Realistic AP-REQ SPNEGO wrapper is ~1.4 KB; a 900-byte placeholder is enough to
+        // exercise the auth_length + sec_trailer plumbing.
+        let token = vec![0xC5u8; 900];
+        let pdu = build_bind_auth_kerberos(9, drs, &token, RPC_C_AUTHN_LEVEL_PKT_PRIVACY);
+        assert_eq!(pdu[2], ptype::BIND);
+        assert_eq!(u16::from_le_bytes([pdu[10], pdu[11]]), token.len() as u16);
+        assert_eq!(u16::from_le_bytes([pdu[8], pdu[9]]) as usize, pdu.len());
+        let st = pdu.len() - token.len() - 8;
+        assert_eq!(pdu[st], RPC_C_AUTHN_GSS_KERBEROS);
+        assert_eq!(pdu[st + 1], RPC_C_AUTHN_LEVEL_PKT_PRIVACY);
+        assert_eq!(&pdu[pdu.len() - token.len()..], &token[..]);
+    }
+
+    #[test]
+    fn auth3_kerberos_carries_gss_type() {
+        // A completing AUTH3 for Kerberos can legitimately be empty (the AP-REP came in the
+        // BIND_ACK and no further token is needed); verify the frame is well-formed anyway.
+        let pdu = build_auth3_kerberos(11, &[], RPC_C_AUTHN_LEVEL_PKT_PRIVACY);
+        assert_eq!(pdu[2], ptype::AUTH3);
+        assert_eq!(u16::from_le_bytes([pdu[10], pdu[11]]), 0);
+        assert_eq!(u16::from_le_bytes([pdu[8], pdu[9]]) as usize, pdu.len());
+        // sec_trailer sits right after the 4-byte pad.
+        assert_eq!(pdu[20], RPC_C_AUTHN_GSS_KERBEROS);
+        assert_eq!(pdu[21], RPC_C_AUTHN_LEVEL_PKT_PRIVACY);
+    }
+
+    #[test]
+    fn request_sealed_krb_variable_auth_len() {
+        // AES-CTS-HMAC-SHA1-96 DCE-style: 16 B WRAP header + 12 B HMAC = 28 B auth_value —
+        // wider than NTLM's fixed 16 B, so the framer must respect the passed length.
+        let sealed = [0xEEu8; 12];
+        let auth_value = [0x77u8; 28];
+        let req = build_request_sealed_krb(3, 0, 0x1234, &sealed, 0, &auth_value, 12);
+        assert_eq!(req[2], ptype::REQUEST);
+        assert_eq!(u16::from_le_bytes([req[10], req[11]]), 28);
+        assert_eq!(u16::from_le_bytes([req[8], req[9]]) as usize, req.len());
+        // sec_trailer sits between the stub and the auth_value.
+        let st = req.len() - auth_value.len() - 8;
+        assert_eq!(req[st], RPC_C_AUTHN_GSS_KERBEROS);
+        assert_eq!(req[st + 1], RPC_C_AUTHN_LEVEL_PKT_PRIVACY);
+        assert_eq!(&req[req.len() - auth_value.len()..], &auth_value[..]);
     }
 
     #[test]

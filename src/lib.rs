@@ -22,6 +22,7 @@ pub mod efsr;
 pub mod epm;
 pub mod fsrvp;
 pub mod icpr;
+pub mod krb_seal;
 pub mod lsat;
 pub mod ndr;
 pub mod netlogon;

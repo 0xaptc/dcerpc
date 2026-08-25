@@ -400,6 +400,39 @@ impl<'a> SmbPipe<'a> {
         Ok(())
     }
 
+    /// Like [`bind_sealed`](Self::bind_sealed) but pass-the-hash: authenticate
+    /// with a raw NT hash instead of a plaintext password.
+    ///
+    /// Use when the SMB session was opened with `SmbClient::login_hash` so that
+    /// the RPC sign+seal BIND also uses the hash — not an empty password that
+    /// the server rejects with `RPC fault 0x00000005`.
+    pub async fn bind_sealed_hash(
+        &mut self,
+        syntax: Syntax,
+        domain: &str,
+        user: &str,
+        nt_hash: &[u8; 16],
+        workstation: &str,
+    ) -> Result<()> {
+        let ntlm = Ntlm::new_sealed();
+        let bind_call_id = self.call_id;
+        self.call_id += 1;
+        let bind = pdu::build_bind_auth(bind_call_id, syntax, ntlm.negotiate());
+        let ack = self.transact(&bind).await?;
+        pdu::expect_bind_ack(&ack)?;
+        let challenge = pdu::extract_auth_value(&ack)?;
+        let (type3, exported) = ntlm
+            .authenticate_hash(&challenge, domain, user, nt_hash, workstation)
+            .map_err(|e| RpcError::Protocol(format!("ntlm authenticate (hash): {e}")))?;
+        let auth3 = pdu::build_auth3(bind_call_id, &type3);
+        self.client
+            .write_pipe(&self.file_id, &auth3)
+            .await
+            .map_err(|e| RpcError::Protocol(format!("auth3 write: {e}")))?;
+        self.seal = Some(SealState::new(&exported));
+        Ok(())
+    }
+
     /// Sign+sealed request over the pipe (single-fragment response — adequate for the small
     /// replies these interfaces return). Mirrors [`RpcTcp::call_sealed`].
     pub async fn call_sealed(&mut self, opnum: u16, stub: &[u8]) -> Result<Vec<u8>> {

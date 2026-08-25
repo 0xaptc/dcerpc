@@ -178,7 +178,11 @@ mod tests {
             &utf16z("CertificateTemplate:VulnUser"),
             &(0..20).collect::<Vec<u8>>(),
         );
-        assert_eq!(s.len(), 152, "stub length must match the MS-ICPR wire format");
+        assert_eq!(
+            s.len(),
+            152,
+            "stub length must match the MS-ICPR wire format"
+        );
         assert_eq!(u32::from_le_bytes(s[0..4].try_into().unwrap()), 0); // dwFlags
         assert_ne!(u32::from_le_bytes(s[4..8].try_into().unwrap()), 0); // authority referent
         assert_eq!(u32::from_le_bytes(s[8..12].try_into().unwrap()), 11); // authority max_count = 11

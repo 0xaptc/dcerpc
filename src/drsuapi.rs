@@ -487,7 +487,7 @@ mod dsname_tests {
         sid[0] = 1; // Revision
         sid[1] = 5; // SubAuthorityCount = 5
         sid[7] = 5; // IdentifierAuthority = 5 (last byte of 6)
-        // SubAuthority[0..4]: 21, a, b, c, 500 (LE u32 each)
+                    // SubAuthority[0..4]: 21, a, b, c, 500 (LE u32 each)
         sid[8..12].copy_from_slice(&21u32.to_le_bytes());
         sid[12..16].copy_from_slice(&11u32.to_le_bytes());
         sid[16..20].copy_from_slice(&22u32.to_le_bytes());

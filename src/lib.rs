@@ -10,6 +10,10 @@
 //! Interface UUIDs are parsed from their canonical strings via `windows_sddl::sid::Guid`,
 //! whose byte layout already matches the DCE UUID on-wire encoding.
 
+// `drsuapi` is #[deprecated] (moved to ms-drsr); allow its internal tests to exercise it
+// without noise. External consumers still see the deprecation in their own crate.
+#![allow(deprecated)]
+
 pub mod dcom;
 pub mod dcom_wmi;
 pub mod dfsnm;

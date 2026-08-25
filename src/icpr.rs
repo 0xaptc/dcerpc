@@ -78,7 +78,7 @@ pub fn decode_cert_server_response(stub: &[u8]) -> Result<EnrollResult> {
 }
 
 /// Marshal CertServerRequest [in] params. `pwszAuthority` is a top-level unique string (referent
-/// + inline WSTR); each CERTTRANSBLOB is a [ref] struct {cb, [unique] pb} with the byte array
+/// plus inline WSTR); each CERTTRANSBLOB is a [ref] struct {cb, [unique] pb} with the byte array
 /// deferred after both fixed parts.
 fn encode_request(authority: &str, attribs: &[u8], request: &[u8]) -> Vec<u8> {
     // Layout mirrors the MS-ICPR NDRCALL byte-for-byte: each pointer's pointee is marshaled
@@ -118,6 +118,7 @@ fn read_blob(d: &mut NdrDecoder) -> Result<Vec<u8>> {
 }
 
 /// Submit a PKCS#10 CSR to `authority` under `template` over a sealed ICPR channel.
+#[allow(clippy::too_many_arguments)]
 pub async fn request_cert(
     client: &mut SmbClient,
     authority: &str,

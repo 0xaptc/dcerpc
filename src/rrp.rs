@@ -237,6 +237,7 @@ impl<'a> RegistryClient<'a> {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn deferred_len(&self) -> usize {
         self.deferred.len()
     }

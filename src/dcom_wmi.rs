@@ -318,6 +318,7 @@ async fn bind_wmi(
 /// Stage 1 live: authenticated `RemoteCreateInstance` of `clsid` on `host` (ISystemActivator over
 /// a sealed ncacn_ip_tcp:135 bind), requesting `iids`. Returns the activated object's StdObjRef
 /// (OXID/OID/IPID — the handle Stage 2 resolves + binds) and the activation HRESULT.
+#[allow(clippy::too_many_arguments)]
 pub async fn remote_create_instance(
     host: &str,
     domain: &str,
@@ -346,6 +347,7 @@ pub async fn remote_create_instance(
 
 /// As [`remote_create_instance`] but returns the raw decrypted reply stub (for parsing / debugging
 /// the ScmReplyInfoData + interface OBJREFs).
+#[allow(clippy::too_many_arguments)]
 pub async fn remote_create_instance_raw(
     host: &str,
     domain: &str,

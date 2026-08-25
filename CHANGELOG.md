@@ -9,7 +9,7 @@ project adheres to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 Nothing pending.
 
-## [0.3.0] — 2026-08-23 *(committed local, not yet published)*
+## [0.2.7] — 2026-08-23 *(committed local, not yet published)*
 
 ### Added — WS-4 Kerberos sealed bind, Phase 1 (offline primitives)
 

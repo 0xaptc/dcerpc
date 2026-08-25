@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn fuzz_epm_parsers_never_panic() {
         let seed = build_tower_with_port(samr(), 49155);
-        let mut s: u64 = 0xEec0_1234_5678_9abc;
+        let mut s: u64 = 0xeec0_1234_5678_9abc;
         let mut rng = || {
             s ^= s >> 12;
             s ^= s << 25;

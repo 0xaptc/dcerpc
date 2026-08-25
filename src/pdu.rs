@@ -240,6 +240,7 @@ pub fn build_request_sealed(
 /// As [`build_request_sealed`] but an ORPC (DCOM object) request: sets `PFC_OBJECT_UUID` and inserts
 /// the 16-byte object UUID (the target interface's IPID) between the opnum and the stub. The stub
 /// therefore begins at offset 40 (header 16 + alloc_hint 4 + p_cont_id 2 + opnum 2 + object 16).
+#[allow(clippy::too_many_arguments)]
 pub fn build_request_sealed_object(
     call_id: u32,
     p_cont_id: u16,

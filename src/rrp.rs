@@ -223,6 +223,32 @@ impl<'a> RegistryClient<'a> {
         })
     }
 
+    /// Like [`connect`] but authenticate with a raw NT hash instead of a
+    /// plaintext password — pass-the-hash at the RPC sign+seal (bind_sealed) layer.
+    ///
+    /// Use when the SMB session was opened with `SmbClient::login_hash`:
+    /// `connect()` would send the NT hash of `""` in the RPC BIND, which the
+    /// server rejects with `RPC fault 0x00000005` (nca_s_fault_access_denied).
+    pub async fn connect_hash(
+        client: &'a mut SmbClient,
+        domain: &str,
+        user: &str,
+        nt_hash: &[u8; 16],
+        host: &str,
+    ) -> Result<RegistryClient<'a>> {
+        let file_id = client
+            .open_pipe("winreg")
+            .await
+            .map_err(|e| RpcError::Protocol(format!("open \\winreg: {e}")))?;
+        let mut pipe = SmbPipe::new(client, file_id);
+        pipe.bind_sealed_hash(winreg_syntax(), domain, user, nt_hash, host)
+            .await?;
+        Ok(RegistryClient {
+            pipe,
+            deferred: std::collections::VecDeque::new(),
+        })
+    }
+
     async fn after_open(&mut self, opened: &Hkey) -> Result<()> {
         self.deferred.push_back(*opened);
         if self.deferred.len() > MAX_DEFERRED {

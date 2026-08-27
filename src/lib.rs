@@ -60,6 +60,23 @@ pub enum RpcError {
 
 pub type Result<T> = std::result::Result<T, RpcError>;
 
+/// Decode a required trailing Win32/NTSTATUS/HRESULT value from an RPC reply stub.
+///
+/// A short reply is malformed, never an implicit success. Keeping this check in one place
+/// prevents interface clients from accidentally mapping an empty hostile response to status 0.
+pub(crate) fn required_tail_u32(stub: &[u8], operation: &str) -> Result<u32> {
+    let bytes = stub
+        .get(
+            stub.len().checked_sub(4).ok_or_else(|| {
+                RpcError::Protocol(format!("{operation} reply too short for status"))
+            })?..,
+        )
+        .ok_or_else(|| RpcError::Protocol(format!("{operation} reply too short for status")))?;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().expect("four-byte slice"),
+    ))
+}
+
 /// NDR decode errors surface as RPC underruns, so `?` works across the boundary.
 impl From<ms_ndr::NdrError> for RpcError {
     fn from(e: ms_ndr::NdrError) -> Self {

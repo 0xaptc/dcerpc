@@ -5,7 +5,7 @@
 
 use crate::ndr::NdrEncoder;
 use crate::transport::{RpcTcp, SmbPipe};
-use crate::{epm, Result, RpcError, Syntax};
+use crate::{epm, required_tail_u32, Result, RpcError, Syntax};
 use smb2_client::SmbClient;
 
 /// MS-RPRN interface (Print System Remote Protocol), v1.0.
@@ -15,6 +15,12 @@ pub fn rprn_syntax() -> Syntax {
 
 pub const OPNUM_OPEN_PRINTER: u16 = 1;
 pub const OPNUM_RFFPCNEX: u16 = 65; // RpcRemoteFindFirstPrinterChangeNotificationEx
+
+/// Decode the required return status from an RFFPCNEx response stub.
+#[doc(hidden)]
+pub fn decode_rffpcnex_status(resp: &[u8]) -> Result<u32> {
+    required_tail_u32(resp, "RpcRemoteFindFirstPrinterChangeNotificationEx")
+}
 
 /// RpcOpenPrinter(pPrinterName [in,string,unique], pHandle [out], pDatatype [in,string,unique]
 /// = NULL, pDevModeContainer [in], AccessRequired [in]).
@@ -81,9 +87,7 @@ impl<'a> PrinterBug<'a> {
                 &encode_rffpcnex(&handle, &format!("\\\\{listener}")),
             )
             .await?;
-        Ok(u32::from_le_bytes(
-            resp[resp.len() - 4..].try_into().unwrap(),
-        ))
+        decode_rffpcnex_status(&resp)
     }
 }
 
@@ -129,9 +133,7 @@ pub async fn printerbug_tcp(
             &encode_rffpcnex(&handle, &format!("\\\\{listener}")),
         )
         .await?;
-    Ok(u32::from_le_bytes(
-        resp[resp.len() - 4..].try_into().unwrap(),
-    ))
+    decode_rffpcnex_status(&resp)
 }
 
 #[cfg(test)]
@@ -150,5 +152,12 @@ mod tests {
         let stub = encode_rffpcnex(&[0x41; 20], "\\\\10.0.0.5");
         assert_eq!(&stub[0..20], &[0x41; 20]); // PRINTER_HANDLE
         assert_eq!(&stub[stub.len() - 4..], &[0, 0, 0, 0]); // pOptions NULL
+    }
+
+    #[test]
+    fn rffpcnex_short_reply_is_an_error() {
+        for len in 0..4 {
+            assert!(decode_rffpcnex_status(&vec![0u8; len]).is_err());
+        }
     }
 }

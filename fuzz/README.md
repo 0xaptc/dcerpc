@@ -1,16 +1,27 @@
 # dcerpc fuzz
 
-libFuzzer-based fuzz targets for every top-level reply decoder in the crate.
-Complements the unit-test fixtures + the bounded-alloc preflight regressions
-that shipped in `dcerpc 0.2.5`.
+libFuzzer targets for the crate's externally reachable reply decoders and DCE/RPC framing
+boundaries. They complement unit regressions for malformed lengths, bounded allocation, and
+authenticated response structure.
 
 ## Targets
 
 | Bin | Function under fuzz |
 |---|---|
 | `srvsvc_decode` | `srvsvc::decode_session_enum` |
-
-*(more targets land in v1.3.10 — `wkssvc_decode`, `samr_decode_*`, `lsat_decode`, `netlogon_decode`, `rrp_decode_*`, `svcctl_decode`, `tsch_decode`)*
+| `wkssvc_decode` | `wkssvc::decode_wksta_user_enum` |
+| `samr_enum_domains` | `samr::decode_enum_domains` |
+| `samr_lookup_domain` | `samr::decode_lookup_domain` |
+| `lsat_lookup_names` | `lsat::decode_lookup_names` |
+| `rrp_query_value` | `rrp::decode_query_value` |
+| `rrp_query_info_class` | `rrp::decode_query_info_class` |
+| `rrp_enum_key` | `rrp::decode_enum_key` |
+| `pdu_parse` | common header, BIND_ACK, plain and sealed response framing |
+| `dcom_stdobjref` | `dcom_wmi::parse_stdobjref` |
+| `rprn_status` | `rprn::decode_rffpcnex_status` |
+| `icpr_response` | `icpr::decode_cert_server_response` |
+| `drsuapi_reply` | `drsuapi::parse_repl_object` |
+| `kerberos_keys` | `drsuapi::parse_kerberos_keys` |
 
 ## Requirements
 
@@ -43,7 +54,7 @@ cargo fuzz coverage srvsvc_decode
 
 ## Contract every decoder is expected to hold
 
-For every reply-decoder fuzz target, **any input** (up to `MAX_INPUT_LEN`) must:
+For every target, **any input** accepted by libFuzzer must:
 
 1. **Never panic** — no `unwrap` / `expect` / arithmetic-overflow / index-out-of-bounds hits.
 2. **Never over-allocate** — bounded-alloc preflight rejects hostile `u32` counts before `Vec::with_capacity`.
@@ -70,8 +81,8 @@ test suite as a `#[test]`).
 - **Windows-native fuzzing** — libFuzzer's clang runtime is Linux-first. Build
   verification on Windows is fine (`cargo +nightly fuzz build …`), but actual
   runs go through WSL / a Linux CI runner.
-- **Non-reply-decoder targets** — the encoder side is fuzz-tested implicitly
-  by round-tripping through decoders. Explicit encoder fuzz would help only
-  once we add builders that accept caller-controlled untrusted input.
+- **Network and SSP state machines** — fuzz targets exercise their pure framing boundary;
+  asynchronous TCP/SMB I/O and stateful NTLM/Kerberos implementations remain covered by unit,
+  integration, and live-lab tests.
 - **Symbolic execution / KLEE-style analysis** — libFuzzer's coverage-guided
   mutation is enough given the input surface here (typically ≤ 4 KB per stub).

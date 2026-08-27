@@ -75,10 +75,10 @@ impl ObjectExporter {
     /// DCOM subsystem and a proof that the ORPC transport binds and calls correctly.
     pub async fn server_alive(&mut self) -> Result<i32> {
         let resp = self.rpc.call(3, &[]).await?;
-        let hr = resp
+        let bytes = resp
             .get(0..4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
-            .unwrap_or(0);
+            .ok_or_else(|| RpcError::Protocol("ServerAlive reply too short for HRESULT".into()))?;
+        let hr = i32::from_le_bytes(bytes.try_into().expect("four-byte HRESULT"));
         if hr != 0 {
             return Err(RpcError::Fault(hr as u32));
         }

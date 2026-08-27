@@ -5,7 +5,7 @@
 
 use crate::ndr::{NdrDecoder, NdrEncoder};
 use crate::transport::SmbPipe;
-use crate::{Result, RpcError, Syntax};
+use crate::{required_tail_u32, Result, RpcError, Syntax};
 use smb2_client::SmbClient;
 use windows_sddl::sid::Sid;
 
@@ -41,9 +41,24 @@ impl SamrHandle {
     pub fn encode(&self, e: &mut NdrEncoder) {
         e.bytes(&self.0);
     }
+    fn is_null(&self) -> bool {
+        self.0 == [0u8; 20]
+    }
 }
 
-/// SamrConnect2(IN [unique,string] ServerName, IN ACCESS_MASK DesiredAccess) → handle.
+const STATUS_MORE_ENTRIES: u32 = 0x0000_0105;
+
+fn validate_enum_status(status: u32, operation: &str) -> Result<()> {
+    if status == 0 || status == STATUS_MORE_ENTRIES {
+        Ok(())
+    } else {
+        Err(RpcError::Protocol(format!(
+            "{operation} failed (NTSTATUS 0x{status:08x})"
+        )))
+    }
+}
+
+/// SamrConnect2 (unique input string `ServerName`, input `DesiredAccess`) → handle.
 pub fn encode_connect2(server: &str, desired_access: u32) -> Vec<u8> {
     let mut e = NdrEncoder::new();
     e.referent(); // non-null unique pointer to ServerName
@@ -67,15 +82,29 @@ pub fn encode_enum_domains(server_handle: &SamrHandle, resume: u32, pref_max: u3
 /// max_count(u32), N × { RelativeId(u32), RPC_UNICODE_STRING{len,max,buf-ptr} } }, then
 /// each non-null name as a conformant-varying wchar array.
 pub fn decode_enum_domains(stub: &[u8]) -> Result<(u32, Vec<(u32, String)>)> {
+    let tail_status = required_tail_u32(stub, "SAMR enumeration")?;
+    validate_enum_status(tail_status, "SAMR enumeration")?;
     let mut d = NdrDecoder::new(stub);
     let resume = d.u32()?;
     let buffer_ref = d.u32()?;
     if buffer_ref == 0 {
+        let count_returned = d.u32()?;
+        let status = d.u32()?;
+        if count_returned != 0 || status != tail_status {
+            return Err(RpcError::Protocol(
+                "SAMR null enumeration buffer carried inconsistent count/status".into(),
+            ));
+        }
         return Ok((resume, Vec::new()));
     }
     let entries = d.u32()? as usize;
     let _array_ref = d.u32()?;
-    let _max_count = d.u32()?;
+    let max_count = d.u32()? as usize;
+    if entries > max_count {
+        return Err(RpcError::Protocol(format!(
+            "SAMR enumeration EntriesRead={entries} exceeds max_count={max_count}"
+        )));
+    }
 
     // Bounded-alloc preflight: each SAMPR_RID_ENUMERATION entry is a `u32` RID
     // + a 4-byte RPC_UNICODE_STRING header (Length u16 + MaxLength u16) + a
@@ -108,6 +137,13 @@ pub fn decode_enum_domains(stub: &[u8]) -> Result<(u32, Vec<(u32, String)>)> {
             String::new()
         };
         out.push((rid, name));
+    }
+    let count_returned = d.u32()? as usize;
+    let status = d.u32()?;
+    if count_returned != entries || status != tail_status {
+        return Err(RpcError::Protocol(format!(
+            "SAMR enumeration inconsistent trailer: entries={entries}, count_returned={count_returned}, status=0x{status:08x}"
+        )));
     }
     Ok((resume, out))
 }
@@ -170,6 +206,12 @@ pub fn encode_lookup_domain(server: &SamrHandle, name: &str) -> Vec<u8> {
 }
 
 pub fn decode_lookup_domain(stub: &[u8]) -> Result<Sid> {
+    let status = required_tail_u32(stub, "SamrLookupDomainInSamServer")?;
+    if status != 0 {
+        return Err(RpcError::Protocol(format!(
+            "SamrLookupDomainInSamServer failed (NTSTATUS 0x{status:08x})"
+        )));
+    }
     let mut d = NdrDecoder::new(stub);
     let sid_ref = d.u32()?;
     if sid_ref == 0 {
@@ -177,7 +219,14 @@ pub fn decode_lookup_domain(stub: &[u8]) -> Result<Sid> {
             "SamrLookupDomain returned no SID".into(),
         ));
     }
-    decode_sid(&mut d)
+    let sid = decode_sid(&mut d)?;
+    let decoded_status = d.u32()?;
+    if decoded_status != status {
+        return Err(RpcError::Protocol(
+            "SamrLookupDomainInSamServer status position is inconsistent".into(),
+        ));
+    }
+    Ok(sid)
 }
 
 /// SamrOpenDomain(IN handle, IN access, IN RPC_SID domain) → domain handle.
@@ -223,16 +272,43 @@ impl<'a> SamrClient<'a> {
     pub async fn connect(&mut self, server: &str) -> Result<SamrHandle> {
         let stub = encode_connect2(server, access::MAXIMUM_ALLOWED);
         let resp = self.pipe.call(opnum::CONNECT2, &stub).await?;
+        let status = required_tail_u32(&resp, "SamrConnect2")?;
+        if status != 0 {
+            return Err(RpcError::Protocol(format!(
+                "SamrConnect2 failed (NTSTATUS 0x{status:08x})"
+            )));
+        }
         let mut d = NdrDecoder::new(&resp);
-        SamrHandle::decode(&mut d)
+        let handle = SamrHandle::decode(&mut d)?;
+        if handle.is_null() {
+            return Err(RpcError::Protocol(
+                "SamrConnect2 returned a null handle".into(),
+            ));
+        }
+        Ok(handle)
     }
 
     /// Enumerate the SAM domains (typically "Builtin" and the account domain).
     pub async fn enumerate_domains(&mut self, server: &SamrHandle) -> Result<Vec<String>> {
-        let stub = encode_enum_domains(server, 0, 0x1000);
-        let resp = self.pipe.call(opnum::ENUM_DOMAINS, &stub).await?;
-        let (_resume, list) = decode_enum_domains(&resp)?;
-        Ok(list.into_iter().map(|(_, name)| name).collect())
+        let mut all = Vec::new();
+        let mut resume = 0u32;
+        loop {
+            let stub = encode_enum_domains(server, resume, 0x1000);
+            let resp = self.pipe.call(opnum::ENUM_DOMAINS, &stub).await?;
+            let (next, list) = decode_enum_domains(&resp)?;
+            let got = list.len();
+            all.extend(list.into_iter().map(|(_, name)| name));
+            let status = required_tail_u32(&resp, "SamrEnumerateDomainsInSamServer")?;
+            if status == 0 {
+                return Ok(all);
+            }
+            if got == 0 || next == resume {
+                return Err(RpcError::Protocol(
+                    "SamrEnumerateDomainsInSamServer made no paging progress".into(),
+                ));
+            }
+            resume = next;
+        }
     }
 
     /// SamrLookupDomainInSamServer → the SID of a named domain.
@@ -248,8 +324,20 @@ impl<'a> SamrClient<'a> {
     pub async fn open_domain(&mut self, server: &SamrHandle, sid: &Sid) -> Result<SamrHandle> {
         let stub = encode_open_domain(server, access::MAXIMUM_ALLOWED, sid);
         let resp = self.pipe.call(opnum::OPEN_DOMAIN, &stub).await?;
+        let status = required_tail_u32(&resp, "SamrOpenDomain")?;
+        if status != 0 {
+            return Err(RpcError::Protocol(format!(
+                "SamrOpenDomain failed (NTSTATUS 0x{status:08x})"
+            )));
+        }
         let mut d = NdrDecoder::new(&resp);
-        SamrHandle::decode(&mut d)
+        let handle = SamrHandle::decode(&mut d)?;
+        if handle.is_null() {
+            return Err(RpcError::Protocol(
+                "SamrOpenDomain returned a null handle".into(),
+            ));
+        }
+        Ok(handle)
     }
 
     /// SamrEnumerateUsersInDomain → [(rid, sAMAccountName)] for the open domain.
@@ -257,7 +345,6 @@ impl<'a> SamrClient<'a> {
         // SamrEnumerateUsersInDomain is paged: it returns up to PreferedMaximumLength of
         // entries plus an EnumerationContext, and NTSTATUS STATUS_MORE_ENTRIES (0x105) while
         // more remain. Loop on the resume handle until the domain is exhausted.
-        const STATUS_MORE_ENTRIES: u32 = 0x0000_0105;
         let mut all = Vec::new();
         let mut resume = 0u32;
         loop {
@@ -267,12 +354,19 @@ impl<'a> SamrClient<'a> {
             let got = list.len();
             all.extend(list);
             // The operation's return NTSTATUS is the trailing 4 bytes of the stub.
-            let status = resp
-                .get(resp.len().wrapping_sub(4)..)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-                .unwrap_or(0);
-            if status != STATUS_MORE_ENTRIES || got == 0 || next == resume {
-                break; // done, or no forward progress (guard against a stuck context)
+            let status = required_tail_u32(&resp, "SamrEnumerateUsersInDomain")?;
+            if status == 0 {
+                break;
+            }
+            if status != STATUS_MORE_ENTRIES {
+                return Err(RpcError::Protocol(format!(
+                    "SamrEnumerateUsersInDomain failed (NTSTATUS 0x{status:08x})"
+                )));
+            }
+            if got == 0 || next == resume {
+                return Err(RpcError::Protocol(
+                    "SamrEnumerateUsersInDomain made no paging progress".into(),
+                ));
             }
             resume = next;
         }
@@ -372,6 +466,7 @@ mod tests {
         let mut e = NdrEncoder::new();
         e.referent();
         encode_sid(&mut e, &sid);
+        e.u32(0); // NTSTATUS
         let stub = e.into_bytes();
         assert_eq!(decode_lookup_domain(&stub).unwrap(), sid);
     }

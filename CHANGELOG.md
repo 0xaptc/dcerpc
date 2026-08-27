@@ -9,6 +9,37 @@ project adheres to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 Nothing pending.
 
+## [0.2.8] — 2026-08-27
+
+### Security
+
+- Validate authenticated RESPONSE fragment structure before security-trailer arithmetic across
+  TCP/SMB and NTLM/Kerberos paths; reject hostile `auth_length`, padding, auth type/level, call ID,
+  PFC sequence and incomplete-fragment inputs.
+- Add default connect, I/O and whole-call deadlines plus 64 MiB/4096-fragment response budgets.
+- Replace silently truncating PDU length casts with checked builders used by both transports.
+- Reject short RPRN/DCOM/interface replies instead of panicking or reporting implicit success.
+- Remove environment-triggered raw DRS and decrypted supplemental-credential dumps.
+
+### Fixed
+
+- Fragment oversized unsealed requests at the negotiated peer limit and reassemble fragmented
+  unsealed responses over TCP and SMB. Oversized sealed requests now fail explicitly instead of
+  emitting malformed/truncated wire lengths.
+- Validate BIND presentation acceptance, negotiated fragment sizes, NDR transfer syntax, and
+  authenticated reply provider/level/padding/context metadata.
+- Attempt SVCCTL service and TSCH task cleanup on every post-creation error path, and surface
+  cleanup failures.
+- Reject overlong Netlogon restore cleartext instead of silently truncating it.
+- Tighten RRP/SAMR/SRVSVC return-status and varying-array validation.
+
+### Testing
+
+- Add regression tests for oversized PDU lengths, malformed fragment lengths, hostile auth
+  lengths, call-ID mismatch, rejected BIND contexts, RPRN/DCOM short replies and Netlogon bounds.
+- Add fuzz targets for PDU/BIND framing, DCOM STDOBJREF, RPRN status, ICPR responses, DRS replies
+  and Kerberos key parsing.
+
 ## [0.2.7] — 2026-08-23 *(committed local, not yet published)*
 
 ### Added — WS-4 Kerberos sealed bind, Phase 1 (offline primitives)
@@ -31,13 +62,11 @@ Nothing pending.
   bad filler, `u16::MAX` RRC, wrong auth_value length — all rejected
   without allocation.
 
-### Deferred to WS-4 Phase 2 (follow-up session)
+### Added — WS-4 Kerberos sealed transport
 
-- Live wire: `RpcTcp::bind_sealed_kerberos` /
-  `SmbPipe::bind_sealed_kerberos` + `call_sealed_kerberos` require an
-  operator-held TGT.
-- Concrete `AesCtsHmacSha1KrbSealer` implementation of the trait, wired
-  against a Kerberos crypto crate.
+- `RpcTcp::bind_sealed_kerberos`, `SmbPipe::bind_sealed_kerberos`, and their sealed call paths
+  wire the Phase 1 framing to a caller-provided `KrbSealer`. TGT/TGS acquisition and the concrete
+  cipher implementation remain outside this transport crate.
 
 ## [0.2.6] — 2026-08-20 *(committed local, not yet published)*
 

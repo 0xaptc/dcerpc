@@ -4,7 +4,7 @@
 
 use crate::ndr::NdrEncoder;
 use crate::transport::SmbPipe;
-use crate::{Result, Syntax};
+use crate::{required_tail_u32, Result, Syntax};
 use smb2_client::SmbClient;
 
 /// The Netdfs interface (MS-DFSNM), v3.0.
@@ -62,13 +62,7 @@ impl<'a> CoerceClient<'a> {
                 &encode_add_std_root(listener, "share", "adhammer"),
             )
             .await?;
-        let status = resp
-            .len()
-            .checked_sub(4)
-            .and_then(|o| resp.get(o..o + 4))
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-            .unwrap_or(0);
-        Ok(status)
+        required_tail_u32(&resp, "NetrDfsAddStdRoot")
     }
 }
 

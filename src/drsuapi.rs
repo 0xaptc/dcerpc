@@ -107,11 +107,14 @@ impl DrsSession {
             d.u8()?;
         }
         let handle: [u8; 20] = d.read_bytes(20)?.try_into().unwrap();
-        let retval = d.u32().unwrap_or(0);
+        let retval = d.u32()?;
         if retval != 0 {
             return Err(RpcError::Protocol(format!(
                 "DRSBind failed: 0x{retval:08x}"
             )));
+        }
+        if handle == [0u8; 20] {
+            return Err(RpcError::Protocol("DRSBind returned a null handle".into()));
         }
         let session_key = rpc
             .session_key()
@@ -244,10 +247,6 @@ impl DrsSession {
     ) -> Result<(u32, [u8; 16], Vec<KerbKey>)> {
         let guid = self.crack_name_to_guid(netbios_domain, name).await?;
         let reply = self.get_nc_changes(&guid).await?;
-        if let Ok(path) = std::env::var("ADHAMMER_DUMP_REPLY") {
-            let _ = std::fs::write(&path, &reply);
-            eprintln!("[dbg] wrote {} bytes of DRS reply to {path}", reply.len());
-        }
         let (rid, nt_enc, supp_enc) = parse_repl_object(&reply)?;
         if nt_enc.is_empty() {
             return Err(RpcError::Protocol(
@@ -259,13 +258,7 @@ impl DrsSession {
         let kerb = if supp_enc.is_empty() {
             Vec::new()
         } else {
-            let blob = drs_decrypt_blob(&self.session_key, &supp_enc).unwrap_or_default();
-            if std::env::var("ADHAMMER_DUMP_SUPP").is_ok() {
-                eprintln!(
-                    "[supp] {}",
-                    blob.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                );
-            }
+            let blob = drs_decrypt_blob(&self.session_key, &supp_enc)?;
             parse_kerberos_keys(&blob)
         };
         Ok((rid, nt, kerb))
@@ -278,7 +271,8 @@ const ATTR_SUPPLEMENTAL_CREDENTIALS: u32 = 0x0009_007d;
 
 /// Walk the DRS_MSG_GETCHGREPLY_V6 to the single replicated object; return
 /// (rid, encrypted unicodePwd, encrypted supplementalCredentials). Walks all attribute values.
-fn parse_repl_object(reply: &[u8]) -> Result<(u32, Vec<u8>, Vec<u8>)> {
+#[doc(hidden)]
+pub fn parse_repl_object(reply: &[u8]) -> Result<(u32, Vec<u8>, Vec<u8>)> {
     let mut d = NdrDecoder::new(reply);
     // --- V6 fixed part ---
     d.u32()?;
@@ -417,7 +411,10 @@ fn skip_dsname(d: &mut NdrDecoder) -> Result<()> {
     d.read_bytes(16)?; // Guid
     d.read_bytes(28)?; // Sid
     d.u32()?; // NameLen
-    d.read_bytes(mc as usize * 2)?; // StringName
+    let name_bytes = (mc as usize)
+        .checked_mul(2)
+        .ok_or_else(|| RpcError::Protocol("DSNAME StringName length overflow".into()))?;
+    d.read_bytes(name_bytes)?; // StringName
     d.align(4);
     Ok(())
 }
@@ -436,7 +433,10 @@ fn read_dsname_rid(d: &mut NdrDecoder) -> Result<u32> {
     d.read_bytes(16)?; // Guid
     let sid = d.read_bytes(28)?.to_vec();
     d.u32()?; // NameLen
-    d.read_bytes(mc as usize * 2)?;
+    let name_bytes = (mc as usize)
+        .checked_mul(2)
+        .ok_or_else(|| RpcError::Protocol("DSNAME StringName length overflow".into()))?;
+    d.read_bytes(name_bytes)?;
     d.align(4);
     if sid_len < 8 {
         return Err(RpcError::Protocol("object DSNAME has no SID".into()));
@@ -562,7 +562,7 @@ fn drs_decrypt_blob(session_key: &[u8; 16], enc: &[u8]) -> Result<Vec<u8>> {
     md5.update(salt);
     let rc4key = md5.finalize();
     let plain = ntlmssp::Rc4::new(&rc4key).apply(&enc[16..]);
-    Ok(plain.get(4..).map(|s| s.to_vec()).unwrap_or_default()) // strip CRC32
+    Ok(plain[4..].to_vec()) // strip CRC32
 }
 
 /// One Kerberos key from supplementalCredentials.
@@ -646,7 +646,10 @@ fn parse_kerb_newer_keys(b: &[u8]) -> Vec<KerbKey> {
         let keytype = u32(base + 12);
         let key_len = u32(base + 16) as usize;
         let key_off = u32(base + 20) as usize;
-        if let Some(k) = b.get(key_off..key_off + key_len) {
+        let Some(key_end) = key_off.checked_add(key_len) else {
+            continue;
+        };
+        if let Some(k) = b.get(key_off..key_end) {
             out.push(KerbKey {
                 keytype,
                 key: k.to_vec(),

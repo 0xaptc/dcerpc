@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A pure-Rust, **no-FFI** DCE/RPC (MS-RPCE) stack — hand-rolled NDR marshaling, connection-oriented
-PDUs, **NTLMSSP sign+seal** for packet privacy, and both TCP (`ncacn_ip_tcp`) and SMB named-pipe
+PDUs, **NTLMSSP and Kerberos sign+seal** for packet privacy, and both TCP (`ncacn_ip_tcp`) and SMB named-pipe
 (`ncacn_np`) transports. On top of the transport: the endpoint mapper (EPM) plus clients for a
 dozen Windows MS-RPC interfaces (SAMR, LSAT, DRSUAPI, SVCCTL, TSCH, EFSR, RPRN, ICPR, SRVSVC,
 FSRVP, DFSNM, RRP, Netlogon, DCOM/WMI).
@@ -17,24 +17,20 @@ Windows domain, static-linkable, one binary.
 
 ## Status
 
-**`0.2.2`** — actively developed. Part of the
+**`0.2.8`** — actively developed. Part of the
 [icedracon Rust offensive AD ecosystem](https://github.com/icedracon) and dogfooded by
 [`adhammer`](https://crates.io/crates/adhammer).
 
-### What's new in 0.2.2
+### What's new in 0.2.8
 
-- **Fire-and-forget `CloseKey`** — the MS-RRP `BaseRegCloseKey` opnum now buffers into a
-  `VecDeque<Hkey>` and flushes as an SMB `WRITE` (instead of the round-trip `TRANSCEIVE`) at
-  `MAX_DEFERRED = 96` or on the next explicit close. Removes a full RPC round-trip per registry
-  handle we open — noticeable on ADCS ESC-registry sweeps that walk dozens of subkeys.
-- **`ms-nrpc` wire (defensive re-exports)** — the pure byte-level Netlogon primitives
-  (`aes_cfb8_encrypt`, `session_key`, `encode_req_challenge`, `encode_authenticate3`, plus the
-  shared constants) are now `pub use` re-exports of [`ms-nrpc`](https://crates.io/crates/ms-nrpc)
-  so downstream detection code shares one implementation. The **destructive** Zerologon writers
-  (`exploit_set_empty_password`, `restore_password`, `restore_password_cleartext`) intentionally
-  stay inline — they carry a `dcerpc::Syntax` / `RpcTcp` in their signatures and cross-crate
-  re-export would make the two `dcerpc` versions in the resolve graph collide at rustc's type
-  checker.
+- Strict PDU, BIND_ACK, presentation-context, call-ID and authenticated security-trailer
+  validation for hostile or malformed RPC peers.
+- Bounded TCP/SMB response streams with connect, I/O and whole-call deadlines plus aggregate
+  byte and fragment limits.
+- Kerberos and NTLM sealed calls over both TCP and SMB named pipes.
+- Panic-free short-reply handling for RPRN/DCOM and strict status decoding across interface
+  clients; transient SVCCTL services and TSCH tasks now clean up on error paths.
+- Six additional fuzz targets for framing, DCOM, RPRN, ICPR and DRS parsing.
 
 ## What it does
 
@@ -46,7 +42,7 @@ you need isn't shipped).
 [ ncacn_ip_tcp  |  ncacn_np (SMB named pipe via smb2-client) ]       transport
 [ bind · alter-context · request · response · fault ]                 pdu
 [ NDR (via ms-ndr): alignment · c-v arrays · unique ptrs · UTF-16 ]   ndr
-[ NTLMSSP sign+seal — auth_level PKT_PRIVACY (via ntlmssp) ]          seal
+[ NTLMSSP or Kerberos sign+seal — auth_level PKT_PRIVACY ]           seal
 [ interface clients: SAMR · LSAT · DRSUAPI · SVCCTL · … ]             api
 ```
 
@@ -77,9 +73,12 @@ use dcerpc::netlogon::{detect_zerologon, Zerologon};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 match detect_zerologon("10.10.10.22", "DC01", 2000).await? {
-    Zerologon::Vulnerable => println!("VULNERABLE (safe-detect only, no reset)"),
-    Zerologon::Patched   => println!("patched"),
-    Zerologon::Unreachable => println!("no netlogon on the wire"),
+    Zerologon::Vulnerable { attempts } => {
+        println!("VULNERABLE after {attempts} attempts (safe-detect only, no reset)")
+    }
+    Zerologon::NotVulnerable { attempts } => {
+        println!("not vulnerable after {attempts} attempts")
+    }
 }
 # Ok(()) }
 ```
@@ -121,12 +120,14 @@ that owns the pipe/transport.
 - ✅ Interfaces above are byte-tested against protocol specs and live-validated against
   fully-patched Windows Server 2022 / 2025 lab DCs.
 - ✅ DCOM/WMI activation → `Win32_Process.Create` with pass-the-hash support.
-- ⚠ `drsuapi` module is a `#[deprecated]` re-export shim — new code should depend on
+- ⚠ The in-crate `drsuapi` implementation is deprecated — new code should depend on
   [`ms-drsr`](https://crates.io/crates/ms-drsr) directly. Will be removed in `0.4.0`.
 - ⚠ Only `PKT_PRIVACY` (sign+seal) is exercised. `PKT_INTEGRITY` (sign-only) is not on the
   hot path for the interfaces shipped, so it's not wired.
-- ⚠ SASL/SPNEGO with Kerberos is out of scope — this crate uses NTLMSSP; if you already have
-  a TGS the KRB path lives in [`adhammer-kerberos`](https://github.com/icedracon/adhammer).
+- ⚠ Kerberos BIND and per-message sealing are supported through the `KrbSealer` trait; acquiring
+  the TGS and providing the concrete Kerberos cryptography remain caller responsibilities.
+- ⚠ TSCH `SchRpcRegisterTask` remains experimental: the current Server 2025 lab returns
+  `nca_s_fault_ndr`. Prefer SVCCTL for validated remote execution until that wire mismatch is fixed.
 
 ## Related icedracon crates
 

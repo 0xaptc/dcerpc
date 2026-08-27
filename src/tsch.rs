@@ -14,6 +14,7 @@ use crate::ndr::NdrEncoder;
 use crate::transport::SmbPipe;
 use crate::{Result, RpcError, Syntax};
 use smb2_client::SmbClient;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The ITaskSchedulerService interface (v1.0).
 pub fn tsch_syntax() -> Syntax {
@@ -103,16 +104,26 @@ fn encode_delete(path: &str) -> Vec<u8> {
 }
 
 /// Trailing HRESULT of a TSCH call (last 4 bytes of the response stub).
-fn hresult(stub: &[u8]) -> u32 {
-    if stub.len() < 4 {
-        return 0xFFFF_FFFF;
-    }
-    u32::from_le_bytes(stub[stub.len() - 4..].try_into().unwrap())
+fn hresult(stub: &[u8], operation: &str) -> Result<u32> {
+    crate::required_tail_u32(stub, operation)
+}
+
+static TASK_TAG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tag() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos
+        ^ (std::process::id() as u64).rotate_left(17)
+        ^ TASK_TAG_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// atexec: register a LocalSystem task running `command`, run it on demand, delete it. `path`
 /// is the task path (e.g. `\ADh<tag>`). Returns the HRESULTs; the caller reads any output file
-/// separately over `C$`. The task is always deleted.
+/// separately over `C$`. Once registration succeeds, deletion is attempted on every exit path;
+/// cleanup failures are surfaced instead of being silently reported as success.
 pub async fn atexec(
     client: &mut SmbClient,
     command: &str,
@@ -121,11 +132,8 @@ pub async fn atexec(
     password: &str,
     host: &str,
 ) -> Result<(String, u32)> {
-    let tag = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let path = format!("\\ADh{tag:08x}");
+    let tag = unique_tag();
+    let path = format!("\\ADh{tag:016x}");
     let xml = task_xml(command);
 
     let file_id = client
@@ -140,15 +148,49 @@ pub async fn atexec(
     let reg = pipe
         .call_sealed(opnum::REGISTER_TASK, &encode_register(&path, &xml))
         .await?;
-    let reg_hr = hresult(&reg);
+    let reg_hr = hresult(&reg, "SchRpcRegisterTask")?;
     if reg_hr != 0 {
         return Err(RpcError::Protocol(format!(
             "SchRpcRegisterTask failed (HRESULT 0x{reg_hr:08x})"
         )));
     }
-    let run = pipe.call_sealed(opnum::RUN, &encode_run(&path)).await?;
-    let run_hr = hresult(&run);
-    let _ = pipe.call_sealed(opnum::DELETE, &encode_delete(&path)).await; // best-effort cleanup
+    let run_result = pipe.call_sealed(opnum::RUN, &encode_run(&path)).await;
+    let delete_result = pipe.call_sealed(opnum::DELETE, &encode_delete(&path)).await;
+
+    let run = match run_result {
+        Ok(run) => run,
+        Err(run_error) => {
+            match delete_result {
+                Ok(delete) => match hresult(&delete, "SchRpcDelete") {
+                    Ok(0) => {}
+                    Ok(delete_hr) => {
+                        return Err(RpcError::Protocol(format!(
+                            "SchRpcRun failed ({run_error}); cleanup SchRpcDelete also failed (HRESULT 0x{delete_hr:08x})"
+                        )));
+                    }
+                    Err(delete_error) => {
+                        return Err(RpcError::Protocol(format!(
+                            "SchRpcRun failed ({run_error}); cleanup reply was invalid ({delete_error})"
+                        )));
+                    }
+                },
+                Err(delete_error) => {
+                    return Err(RpcError::Protocol(format!(
+                        "SchRpcRun failed ({run_error}); cleanup SchRpcDelete also failed ({delete_error})"
+                    )));
+                }
+            }
+            return Err(run_error);
+        }
+    };
+    let delete = delete_result?;
+    let delete_hr = hresult(&delete, "SchRpcDelete")?;
+    if delete_hr != 0 {
+        return Err(RpcError::Protocol(format!(
+            "SchRpcDelete failed (HRESULT 0x{delete_hr:08x})"
+        )));
+    }
+    let run_hr = hresult(&run, "SchRpcRun")?;
 
     Ok((path, run_hr))
 }

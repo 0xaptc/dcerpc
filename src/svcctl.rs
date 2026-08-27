@@ -8,8 +8,9 @@
 
 use crate::ndr::{NdrDecoder, NdrEncoder};
 use crate::transport::SmbPipe;
-use crate::{Result, RpcError, Syntax};
+use crate::{required_tail_u32, Result, RpcError, Syntax};
 use smb2_client::SmbClient;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The Service Control Manager Remote interface (v2.0).
 pub fn svcctl_syntax() -> Syntax {
@@ -113,11 +114,20 @@ fn encode_handle_only(h: &ScHandle) -> Vec<u8> {
 }
 
 /// The trailing NDR return value (a Win32 error) of an SCM call.
-fn tail_return(stub: &[u8]) -> u32 {
-    if stub.len() < 4 {
-        return u32::MAX;
-    }
-    u32::from_le_bytes(stub[stub.len() - 4..].try_into().unwrap())
+fn tail_return(stub: &[u8], operation: &str) -> Result<u32> {
+    required_tail_u32(stub, operation)
+}
+
+static SERVICE_TAG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tag() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos
+        ^ (std::process::id() as u64).rotate_left(17)
+        ^ SERVICE_TAG_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// High-level SVCCTL client bound over an SMB `\PIPE\svcctl`.
@@ -142,7 +152,7 @@ impl<'a> SvcctlClient<'a> {
             .await?;
         let mut d = NdrDecoder::new(&resp);
         let handle = ScHandle::decode(&mut d)?;
-        let ret = d.u32().unwrap_or(u32::MAX);
+        let ret = d.u32()?;
         if ret != 0 || handle.is_null() {
             return Err(RpcError::Protocol(format!(
                 "ROpenSCManagerW failed (win32 {ret})"
@@ -164,7 +174,7 @@ impl<'a> SvcctlClient<'a> {
                 &encode_create_service(scm, name, binpath),
             )
             .await?;
-        let ret = tail_return(&resp);
+        let ret = tail_return(&resp, "RCreateServiceW")?;
         if ret != 0 {
             return Err(RpcError::Protocol(format!(
                 "RCreateServiceW failed (win32 {ret})"
@@ -174,9 +184,15 @@ impl<'a> SvcctlClient<'a> {
         let mut d = NdrDecoder::new(&resp);
         let tag_ref = d.u32()?;
         if tag_ref != 0 {
-            let _ = d.u32(); // tag value
+            let _ = d.u32()?; // tag value
         }
-        ScHandle::decode(&mut d)
+        let handle = ScHandle::decode(&mut d)?;
+        if handle.is_null() {
+            return Err(RpcError::Protocol(
+                "RCreateServiceW returned a null service handle".into(),
+            ));
+        }
+        Ok(handle)
     }
 
     /// Start the service (the command executes); SCM start-timeout/exception = command ran.
@@ -185,7 +201,7 @@ impl<'a> SvcctlClient<'a> {
             .pipe
             .call(opnum::START_SERVICE_W, &encode_start_service(svc))
             .await?;
-        Ok(tail_return(&resp))
+        tail_return(&resp, "RStartServiceW")
     }
 
     async fn delete_service(&mut self, svc: &ScHandle) -> Result<u32> {
@@ -193,7 +209,7 @@ impl<'a> SvcctlClient<'a> {
             .pipe
             .call(opnum::DELETE_SERVICE, &encode_handle_only(svc))
             .await?;
-        Ok(tail_return(&resp))
+        tail_return(&resp, "RDeleteService")
     }
 
     async fn close_handle(&mut self, h: &ScHandle) {
@@ -216,16 +232,14 @@ pub struct ExecResult {
 /// psexec-style command execution over SVCCTL. Creates a service whose binary detaches the real
 /// work (`start "" /b`, so it survives the SCM tearing the service down), redirects its output
 /// to a temp file on the target, starts it as LocalSystem, deletes the service, then reads the
-/// output back over `C$` (delete-on-close). The service and temp file are always cleaned up.
+/// output back over `C$` (delete-on-close). A cleanup failure is returned to the caller rather
+/// than being reported as success.
 ///
 /// `host` is the target used for the `\\host\C$` output read.
 pub async fn exec(client: &mut SmbClient, host: &str, command: &str) -> Result<ExecResult> {
-    let tag = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let name = format!("ADh{tag:08x}");
-    let out_rel = format!("Windows\\Temp\\ADh{tag:08x}.out"); // relative to C$ root
+    let tag = unique_tag();
+    let name = format!("ADh{tag:016x}");
+    let out_rel = format!("Windows\\Temp\\ADh{tag:016x}.out"); // relative to C$ root
     let out_win = format!("C:\\{out_rel}"); // absolute path for the redirect
                                             // Detach the real work so it outlives the SCM teardown; redirect stdout+stderr to the file.
     let full = format!("{command} > {out_win} 2>&1");
@@ -280,11 +294,8 @@ pub async fn exec(client: &mut SmbClient, host: &str, command: &str) -> Result<E
 /// (e.g. `reg save`) whose result is a file the caller reads separately. Returns the SCM start
 /// code. Requires the client to be tree-connected to IPC$. Detaches via `start "" /b`.
 pub async fn run(client: &mut SmbClient, command: &str) -> Result<u32> {
-    let tag = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let name = format!("ADh{tag:08x}");
+    let tag = unique_tag();
+    let name = format!("ADh{tag:016x}");
     let binpath = format!("%COMSPEC% /Q /c start \"\" /b %COMSPEC% /Q /c \"{command}\"");
     create_start_delete(client, &name, &binpath).await
 }
@@ -297,13 +308,41 @@ async fn create_start_delete(client: &mut SmbClient, name: &str, binpath: &str) 
         .map_err(|e| RpcError::Protocol(format!("open \\svcctl: {e}")))?;
     let mut scm = SvcctlClient::bind(client, file_id).await?;
     let scm_handle = scm.open_scm().await?;
-    let svc = scm.create_service(&scm_handle, name, binpath).await?;
-    let start_ret = scm.start_service(&svc).await?;
-    let del_ret = scm.delete_service(&svc).await?;
+    let svc = match scm.create_service(&scm_handle, name, binpath).await {
+        Ok(svc) => svc,
+        Err(error) => {
+            scm.close_handle(&scm_handle).await;
+            return Err(error);
+        }
+    };
+
+    // Always attempt deletion after a service handle exists, even if START failed on the wire.
+    let start_result = scm.start_service(&svc).await;
+    let delete_result = scm.delete_service(&svc).await;
     scm.close_handle(&svc).await;
     scm.close_handle(&scm_handle).await;
+
+    let start_ret = match start_result {
+        Ok(start_ret) => start_ret,
+        Err(start_error) => match delete_result {
+            Ok(0) => return Err(start_error),
+            Ok(delete_status) => {
+                return Err(RpcError::Protocol(format!(
+                        "RStartServiceW failed ({start_error}); cleanup RDeleteService also failed (win32 {delete_status})"
+                    )));
+            }
+            Err(delete_error) => {
+                return Err(RpcError::Protocol(format!(
+                        "RStartServiceW failed ({start_error}); cleanup RDeleteService also failed ({delete_error})"
+                    )));
+            }
+        },
+    };
+    let del_ret = delete_result?;
     if del_ret != 0 {
-        tracing::warn!("RDeleteService returned win32 {del_ret}");
+        return Err(RpcError::Protocol(format!(
+            "RDeleteService failed (win32 {del_ret})"
+        )));
     }
     Ok(start_ret)
 }

@@ -264,8 +264,14 @@ pub fn parse_stdobjref(reply: &[u8]) -> Result<StdObjRef> {
             let flags = u32::from_le_bytes(reply[i + 4..i + 8].try_into().unwrap());
             if flags == 1 {
                 // OBJREF_STANDARD: after signature(4)+flags(4)+iid(16) comes STDOBJREF.
-                let s = i + 8 + 16;
-                let mut d = NdrDecoder::new(&reply[s..]);
+                let Some(s) = i.checked_add(24) else {
+                    break;
+                };
+                let Some(stdobjref) = reply.get(s..s.saturating_add(40)) else {
+                    i += 1;
+                    continue;
+                };
+                let mut d = NdrDecoder::new(stdobjref);
                 let _std_flags = d.u32()?;
                 let _public_refs = d.u32()?;
                 let oxid = d.u64()?;
@@ -722,5 +728,15 @@ mod tests {
         assert_eq!(s.oxid, 0x1122_3344_5566_7788);
         assert_eq!(s.oid, 0x99AA_BBCC_DDEE_FF00);
         assert_eq!(s.ipid, [0x22; 16]);
+    }
+
+    #[test]
+    fn stdobjref_rejects_truncated_signature_without_panicking() {
+        for suffix in 0..40 {
+            let mut reply = vec![0xAA; suffix];
+            reply.extend_from_slice(b"MEOW");
+            reply.extend_from_slice(&1u32.to_le_bytes());
+            assert!(parse_stdobjref(&reply).is_err());
+        }
     }
 }

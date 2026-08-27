@@ -70,3 +70,45 @@ path = "fuzz_targets/rrp_enum_key.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "pdu_parse"
+path = "fuzz_targets/pdu_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcom_stdobjref"
+path = "fuzz_targets/dcom_stdobjref.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rprn_status"
+path = "fuzz_targets/rprn_status.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "icpr_response"
+path = "fuzz_targets/icpr_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "drsuapi_reply"
+path = "fuzz_targets/drsuapi_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kerberos_keys"
+path = "fuzz_targets/kerberos_keys.rs"
+test = false
+doc = false
+bench = false

@@ -45,7 +45,7 @@ pub fn utf16z_string(s: &str) -> Vec<u8> {
 /// Opnum of `CertServerRequest` — exported so relay flows can call it via the transport.
 pub const CERT_SERVER_REQUEST_OPNUM: u16 = CERT_SERVER_REQUEST;
 
-/// Marshal `CertServerRequest` [in] params for a caller that owns its own transport
+/// Marshal `CertServerRequest` input parameters for a caller that owns its own transport.
 /// (e.g. an ncacn_ip_tcp `RpcTcp` after a relayed bind). Same NDR shape as the sealed-pipe
 /// path; broken out so the relay code doesn't duplicate the encoder.
 pub fn encode_cert_server_request(authority: &str, template: &str, csr_der: &[u8]) -> Vec<u8> {

@@ -9,7 +9,7 @@
 
 use crate::ndr::{NdrDecoder, NdrEncoder};
 use crate::transport::SmbPipe;
-use crate::{Result, Syntax};
+use crate::{Result, RpcError, Syntax};
 use smb2_client::SmbClient;
 
 /// The SRVSVC interface, v3.0.
@@ -56,20 +56,30 @@ pub fn encode_session_enum() -> Vec<u8> {
 /// Returns (sessions, total_entries, return_code).
 pub fn decode_session_enum(stub: &[u8]) -> Result<(Vec<Session>, u32, u32)> {
     let mut d = NdrDecoder::new(stub);
-    let _level = d.u32()?; // Level (echoed)
-    let _tag = d.u32()?; // union discriminant
+    let level = d.u32()?; // Level (echoed)
+    let tag = d.u32()?; // union discriminant
+    if level != SESSION_LEVEL_10 || tag != SESSION_LEVEL_10 {
+        return Err(RpcError::Protocol(format!(
+            "NetrSessionEnum returned unexpected level/tag {level}/{tag}"
+        )));
+    }
     let container_ref = d.u32()?; // Level10 container [ref]
     let mut sessions = Vec::new();
     if container_ref != 0 {
         let entries_read = d.u32()? as usize;
         let buffer_ref = d.u32()?;
         if buffer_ref != 0 {
-            let _max = d.u32()?; // conformant max_count
-                                 // Fixed parts: EntriesRead × { cname ptr, user ptr, time, idle } — 16 wire bytes
-                                 // per entry. Bound `entries_read` (attacker-controlled u32) against the remaining
-                                 // stub before `Vec::with_capacity` so a hostile server sending
-                                 // `entries_read = 0xFFFFFFFF` + a truncated tail can't request a multi-GB
-                                 // allocation that aborts via `handle_alloc_error`.
+            let max_count = d.u32()? as usize; // conformant max_count
+            if entries_read > max_count {
+                return Err(RpcError::Protocol(format!(
+                    "NetrSessionEnum EntriesRead={entries_read} exceeds max_count={max_count}"
+                )));
+            }
+            // Fixed parts: EntriesRead × { cname ptr, user ptr, time, idle } — 16 wire bytes
+            // per entry. Bound `entries_read` (attacker-controlled u32) against the remaining
+            // stub before `Vec::with_capacity` so a hostile server sending
+            // `entries_read = 0xFFFFFFFF` + a truncated tail can't request a multi-GB
+            // allocation that aborts via `handle_alloc_error`.
             if entries_read
                 .checked_mul(16)
                 .map_or(true, |need| need > d.remaining())
@@ -102,13 +112,13 @@ pub fn decode_session_enum(stub: &[u8]) -> Result<(Vec<Session>, u32, u32)> {
             }
         }
     }
-    let total_entries = d.u32().unwrap_or(sessions.len() as u32);
+    let total_entries = d.u32()?;
     // ResumeHandle [in,out,unique]: a referent, then the value if non-null.
-    let resume_ref = d.u32().unwrap_or(0);
+    let resume_ref = d.u32()?;
     if resume_ref != 0 {
-        let _resume = d.u32();
+        let _resume = d.u32()?;
     }
-    let ret = d.u32().unwrap_or(0);
+    let ret = d.u32()?;
     Ok((sessions, total_entries, ret))
 }
 

@@ -15,7 +15,7 @@
 
 use crate::ndr::{NdrDecoder, NdrEncoder};
 use crate::transport::SmbPipe;
-use crate::{Result, RpcError, Syntax};
+use crate::{required_tail_u32, Result, RpcError, Syntax};
 use smb2_client::SmbClient;
 
 /// The Windows Remote Registry interface (winreg, v1.0).
@@ -171,6 +171,12 @@ fn encode_close(hkey: &Hkey) -> Vec<u8> {
 /// lpcbData, lpcbLen, then the Win32 return. Returns the value's type + bytes.
 #[doc(hidden)]
 pub fn decode_query_value(stub: &[u8]) -> Result<RegValue> {
+    let ret = required_tail_u32(stub, "BaseRegQueryValue")?;
+    if ret != 0 {
+        return Err(RpcError::Protocol(format!(
+            "BaseRegQueryValue failed (win32 {ret})"
+        )));
+    }
     let mut d = NdrDecoder::new(stub);
     // lpType (unique)
     let mut ty = 0u32;
@@ -180,11 +186,41 @@ pub fn decode_query_value(stub: &[u8]) -> Result<RegValue> {
     // lpData (unique) → conformant-varying byte array
     let mut data = Vec::new();
     if d.u32()? != 0 {
-        let _max = d.u32()?;
-        let _off = d.u32()?;
+        let max = d.u32()?;
+        let off = d.u32()?;
         let actual = d.u32()? as usize;
+        if off > max || (actual as u32) > max - off {
+            return Err(RpcError::Protocol(format!(
+                "BaseRegQueryValue invalid varying array max={max}, offset={off}, actual={actual}"
+            )));
+        }
         data = d.read_bytes(actual)?.to_vec();
         d.align(4);
+    }
+    let data_len = if d.u32()? != 0 { Some(d.u32()?) } else { None };
+    let total_len = if d.u32()? != 0 { Some(d.u32()?) } else { None };
+    let decoded_ret = d.u32()?;
+    if decoded_ret != ret {
+        return Err(RpcError::Protocol(
+            "BaseRegQueryValue status position is inconsistent".into(),
+        ));
+    }
+    if let Some(data_len) = data_len {
+        if data.len() > data_len as usize {
+            return Err(RpcError::Protocol(format!(
+                "BaseRegQueryValue returned {} bytes but lpcbData={data_len}",
+                data.len()
+            )));
+        }
+    }
+    if let Some(total_len) = total_len {
+        if let Some(data_len) = data_len {
+            if total_len < data_len {
+                return Err(RpcError::Protocol(format!(
+                    "BaseRegQueryValue lpcbLen={total_len} is smaller than lpcbData={data_len}"
+                )));
+            }
+        }
     }
     Ok(RegValue { ty, data })
 }
@@ -223,7 +259,7 @@ impl<'a> RegistryClient<'a> {
         })
     }
 
-    /// Like [`connect`] but authenticate with a raw NT hash instead of a
+    /// Like [`Self::connect`] but authenticate with a raw NT hash instead of a
     /// plaintext password — pass-the-hash at the RPC sign+seal (bind_sealed) layer.
     ///
     /// Use when the SMB session was opened with `SmbClient::login_hash`:
@@ -502,6 +538,12 @@ fn encode_query_info_key(key: &Hkey) -> Vec<u8> {
 /// only care about the class name here.
 #[doc(hidden)]
 pub fn decode_query_info_class(stub: &[u8]) -> Result<String> {
+    let ret = required_tail_u32(stub, "BaseRegQueryInfoKey")?;
+    if ret != 0 {
+        return Err(RpcError::Protocol(format!(
+            "BaseRegQueryInfoKey failed (win32 {ret})"
+        )));
+    }
     let mut d = NdrDecoder::new(stub);
     // lpClassOut: RRP_UNICODE_STRING { Length, MaximumLength, Buffer[unique] } then deferred
     // WSTR buffer if referent != 0. Length is the used bytes (NUL included).
@@ -579,13 +621,15 @@ fn encode_enum_key(key: &Hkey, dw_index: u32) -> Vec<u8> {
 /// tail — the normal end-of-enumeration marker.
 #[doc(hidden)]
 pub fn decode_enum_key(stub: &[u8]) -> Result<Option<String>> {
-    if stub.len() < 4 {
+    let ret = required_tail_u32(stub, "BaseRegEnumKey")?;
+    if ret == 0x0000_0103 {
+        // NO_MORE_ITEMS — normal end of enumeration.
         return Ok(None);
     }
-    let ret = u32::from_le_bytes(stub[stub.len() - 4..].try_into().unwrap());
-    if ret == 0x0000_0103 || ret == 0x0000_00EA {
-        // NO_MORE_ITEMS or MORE_DATA at end — treat as "done".
-        return Ok(None);
+    if ret == 0x0000_00EA {
+        return Err(RpcError::Protocol(
+            "BaseRegEnumKey returned ERROR_MORE_DATA; supplied name buffer was too small".into(),
+        ));
     }
     if ret != 0 {
         return Err(RpcError::Protocol(format!(
@@ -712,7 +756,8 @@ mod tests {
 
     #[test]
     fn query_info_class_actual_is_bounded_against_stub() {
-        let stub = hostile_ustr_reply(0xFFFF_FFFF);
+        let mut stub = hostile_ustr_reply(0xFFFF_FFFF);
+        stub.extend_from_slice(&0u32.to_le_bytes());
         let err = decode_query_info_class(&stub).unwrap_err();
         assert!(
             matches!(err, RpcError::Protocol(ref s) if s.contains("actual=")),

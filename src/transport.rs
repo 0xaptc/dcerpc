@@ -15,6 +15,10 @@ pub struct RpcTcp {
     /// [`bind_relay_start`](RpcTcp::bind_relay_start) and
     /// [`bind_relay_finish`](RpcTcp::bind_relay_finish).
     pending_relay_bind: Option<u32>,
+    /// Kerberos sealer (mutually exclusive with `seal`), set when the connection
+    /// was bound via `bind_sealed_kerberos`. Owns the trait object so the concrete
+    /// crypto impl stays outside this crate.
+    krb_seal: Option<Box<dyn crate::krb_seal::KrbSealer + Send>>,
 }
 
 impl RpcTcp {
@@ -27,6 +31,7 @@ impl RpcTcp {
             seal: None,
             session_key: None,
             pending_relay_bind: None,
+            krb_seal: None,
         })
     }
 
@@ -177,6 +182,100 @@ impl RpcTcp {
         );
         self.send(&auth3).await?; // AUTH3 is unacknowledged
         Ok(())
+    }
+
+    /// Kerberos sign+seal BIND for ncacn_ip_tcp (port 135 / EPM-resolved). Mirror of
+    /// [`SmbPipe::bind_sealed_kerberos`] — parameters and semantics are identical, only the
+    /// underlying transport differs.
+    pub async fn bind_sealed_kerberos(
+        &mut self,
+        syntax: Syntax,
+        ap_req_gss_token: &[u8],
+        sealer: Box<dyn crate::krb_seal::KrbSealer + Send>,
+    ) -> Result<()> {
+        let bind_call_id = self.call_id;
+        self.call_id += 1;
+        let bind = pdu::build_bind_auth_kerberos(
+            bind_call_id,
+            syntax,
+            ap_req_gss_token,
+            pdu::RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+        );
+        self.send(&bind).await?;
+        let ack = self.recv().await?;
+        pdu::expect_bind_ack(&ack)?;
+        let _ = pdu::extract_auth_value(&ack);
+        let auth3 = pdu::build_auth3_kerberos(bind_call_id, &[], pdu::RPC_C_AUTHN_LEVEL_PKT_PRIVACY);
+        self.send(&auth3).await?;
+        self.krb_seal = Some(sealer);
+        Ok(())
+    }
+
+    /// Kerberos sealed request over a TCP-bound session. Mirrors
+    /// [`SmbPipe::call_sealed_kerberos`].
+    pub async fn call_sealed_kerberos(&mut self, opnum: u16, stub: &[u8]) -> Result<Vec<u8>> {
+        const STUB_OFF: usize = 24;
+        let pad_len = ((4 - (stub.len() % 4)) % 4) as u8;
+        let mut stub_padded = stub.to_vec();
+        stub_padded.extend(std::iter::repeat(0u8).take(pad_len as usize));
+
+        let auth_value_len = self
+            .krb_seal
+            .as_ref()
+            .ok_or_else(|| RpcError::Protocol("session not kerberos-sealed".into()))?
+            .auth_value_len();
+
+        let placeholder_av = vec![0u8; auth_value_len];
+        let mut req = pdu::build_request_sealed_krb(
+            self.call_id,
+            0,
+            opnum,
+            &stub_padded,
+            pad_len,
+            &placeholder_av,
+            stub.len() as u32,
+        );
+        self.call_id += 1;
+        let n = req.len();
+        let sign_over = req[..n - auth_value_len].to_vec();
+        let sealer = self.krb_seal.as_mut().expect("checked above");
+        let (sealed, auth_value) = sealer.seal_pdu(&sign_over, &stub_padded);
+        req[STUB_OFF..STUB_OFF + stub_padded.len()].copy_from_slice(&sealed);
+        req[n - auth_value_len..].copy_from_slice(&auth_value);
+        self.send(&req).await?;
+
+        const PFC_LAST_FRAG: u8 = 0x02;
+        let mut plain = Vec::new();
+        loop {
+            let resp = self.recv().await?;
+            let h = pdu::parse_header(&resp)?;
+            if h.ptype == pdu::ptype::FAULT {
+                let status = resp
+                    .get(24..28)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0);
+                return Err(RpcError::Fault(status));
+            }
+            if h.ptype != pdu::ptype::RESPONSE {
+                return Err(RpcError::UnexpectedPdu(h.ptype));
+            }
+            let pfc = resp[3];
+            let auth_length = u16::from_le_bytes([resp[10], resp[11]]) as usize;
+            let frag = (h.frag_length as usize).min(resp.len());
+            let sec_trailer_start = frag - 8 - auth_length;
+            let resp_pad = resp[sec_trailer_start + 2] as usize;
+            let av = resp[frag - auth_length..frag].to_vec();
+            let pdu_no_av = &resp[..frag - auth_length];
+            let sealer = self.krb_seal.as_mut().unwrap();
+            let mut chunk =
+                sealer.unseal_pdu(pdu_no_av, STUB_OFF, sec_trailer_start - STUB_OFF, &av)?;
+            chunk.truncate(chunk.len().saturating_sub(resp_pad));
+            plain.extend_from_slice(&chunk);
+            if pfc & PFC_LAST_FRAG != 0 {
+                break;
+            }
+        }
+        Ok(plain)
     }
 
     /// Issue a sign+sealed request over an authenticated ([`bind_sealed`](Self::bind_sealed))
@@ -337,6 +436,11 @@ pub struct SmbPipe<'a> {
     file_id: [u8; 16],
     call_id: u32,
     seal: Option<SealState>,
+    /// Kerberos sealer (mutually exclusive with `seal`): set when the pipe was
+    /// bound via `bind_sealed_kerberos`; owns the trait object so the concrete
+    /// crypto impl (e.g. adhammer-kerberos's AES256-CTS-HMAC-SHA1-96 sealer)
+    /// stays outside this crate.
+    krb_seal: Option<Box<dyn crate::krb_seal::KrbSealer + Send>>,
 }
 
 impl<'a> SmbPipe<'a> {
@@ -346,6 +450,7 @@ impl<'a> SmbPipe<'a> {
             file_id,
             call_id: 1,
             seal: None,
+            krb_seal: None,
         }
     }
 
@@ -431,6 +536,130 @@ impl<'a> SmbPipe<'a> {
             .map_err(|e| RpcError::Protocol(format!("auth3 write: {e}")))?;
         self.seal = Some(SealState::new(&exported));
         Ok(())
+    }
+
+    /// Kerberos sign+seal BIND (auth_type = GSS_KERBEROS, auth_level = PKT_PRIVACY).
+    /// The `ap_req_gss_token` is a GSS-API `InitialContextToken(SPNEGO → krb5(AP-REQ))` built
+    /// by a Kerberos crate (e.g. adhammer-kerberos's `build_ap_req_gss`); `sealer` is the
+    /// concrete `KrbSealer` impl that already holds the same session key the AP-REQ was
+    /// built with. The AP-REQ here has mutual-required OFF, so the ack carries no AP-REP
+    /// and AUTH3 is empty — kept present because Windows expects a close-of-negotiation PDU.
+    pub async fn bind_sealed_kerberos(
+        &mut self,
+        syntax: Syntax,
+        ap_req_gss_token: &[u8],
+        sealer: Box<dyn crate::krb_seal::KrbSealer + Send>,
+    ) -> Result<()> {
+        let bind_call_id = self.call_id;
+        self.call_id += 1;
+        let bind = pdu::build_bind_auth_kerberos(
+            bind_call_id,
+            syntax,
+            ap_req_gss_token,
+            pdu::RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+        );
+        let ack = self.transact(&bind).await?;
+        pdu::expect_bind_ack(&ack)?;
+        // For non-mutual (ap_options=0) the ack has no verifier — extract is best-effort.
+        // If a caller uses mutual-required they should verify the AP-REP separately before
+        // trusting the sealer's server_seq; this scaffolding is minimum-mutual.
+        let _ = pdu::extract_auth_value(&ack);
+        let auth3 = pdu::build_auth3_kerberos(bind_call_id, &[], pdu::RPC_C_AUTHN_LEVEL_PKT_PRIVACY);
+        self.client
+            .write_pipe(&self.file_id, &auth3)
+            .await
+            .map_err(|e| RpcError::Protocol(format!("auth3 write: {e}")))?;
+        self.krb_seal = Some(sealer);
+        Ok(())
+    }
+
+    /// Sign+sealed request over a Kerberos-bound pipe. Uses `build_request_sealed_krb` with
+    /// the sealer's auth_value length (varies per Kerberos etype — 28 for AES256-CTS-HMAC-SHA1-96
+    /// under the current dcerpc contract). Mirrors [`call_sealed`](Self::call_sealed).
+    pub async fn call_sealed_kerberos(&mut self, opnum: u16, stub: &[u8]) -> Result<Vec<u8>> {
+        const STUB_OFF: usize = 24;
+        let pad_len = ((4 - (stub.len() % 4)) % 4) as u8;
+        let mut stub_padded = stub.to_vec();
+        stub_padded.extend(std::iter::repeat(0u8).take(pad_len as usize));
+
+        let auth_value_len = self
+            .krb_seal
+            .as_ref()
+            .ok_or_else(|| RpcError::Protocol("pipe not kerberos-sealed".into()))?
+            .auth_value_len();
+
+        let placeholder_av = vec![0u8; auth_value_len];
+        let mut req = pdu::build_request_sealed_krb(
+            self.call_id,
+            0,
+            opnum,
+            &stub_padded,
+            pad_len,
+            &placeholder_av,
+            stub.len() as u32,
+        );
+        self.call_id += 1;
+        let n = req.len();
+        let sign_over = req[..n - auth_value_len].to_vec();
+        let sealer = self.krb_seal.as_mut().expect("checked above");
+        let (sealed, auth_value) = sealer.seal_pdu(&sign_over, &stub_padded);
+        req[STUB_OFF..STUB_OFF + stub_padded.len()].copy_from_slice(&sealed);
+        req[n - auth_value_len..].copy_from_slice(&auth_value);
+
+        const PFC_LAST_FRAG: u8 = 0x02;
+        let mut raw = self.transact(&req).await?;
+        let mut plain = Vec::new();
+        let mut off = 0usize;
+        loop {
+            let mut hit_last = false;
+            while off + 16 <= raw.len() {
+                let h = pdu::parse_header(&raw[off..])?;
+                if h.ptype == pdu::ptype::FAULT {
+                    let status = raw
+                        .get(off + 24..off + 28)
+                        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                        .unwrap_or(0);
+                    return Err(RpcError::Fault(status));
+                }
+                if h.ptype != pdu::ptype::RESPONSE {
+                    return Err(RpcError::UnexpectedPdu(h.ptype));
+                }
+                let frag = h.frag_length as usize;
+                if frag < 24 || off + frag > raw.len() {
+                    break;
+                }
+                let pdu = &raw[off..off + frag];
+                let pfc = pdu[3];
+                let auth_length = u16::from_le_bytes([pdu[10], pdu[11]]) as usize;
+                let sec_trailer_start = frag - 8 - auth_length;
+                let resp_pad = pdu[sec_trailer_start + 2] as usize;
+                let av = pdu[frag - auth_length..frag].to_vec();
+                let pdu_no_av = &pdu[..frag - auth_length];
+                let sealer = self.krb_seal.as_mut().unwrap();
+                let mut chunk =
+                    sealer.unseal_pdu(pdu_no_av, STUB_OFF, sec_trailer_start - STUB_OFF, &av)?;
+                chunk.truncate(chunk.len().saturating_sub(resp_pad));
+                plain.extend_from_slice(&chunk);
+                off += frag;
+                if pfc & PFC_LAST_FRAG != 0 {
+                    hit_last = true;
+                    break;
+                }
+            }
+            if hit_last {
+                break;
+            }
+            let more = self
+                .client
+                .read_pipe(&self.file_id, 0x0001_0000)
+                .await
+                .map_err(|e| RpcError::Protocol(format!("pipe read: {e}")))?;
+            if more.is_empty() {
+                break;
+            }
+            raw.extend_from_slice(&more);
+        }
+        Ok(plain)
     }
 
     /// Sign+sealed request over the pipe (single-fragment response — adequate for the small

@@ -356,12 +356,27 @@ pub fn parse_header(buf: &[u8]) -> Result<Header> {
 }
 
 /// Confirm a BIND_ACK (or surface a BIND_NAK). We do not parse per-context results here;
-/// a NAK is fatal and an ACK is sufficient to proceed.
+/// a NAK is fatal and an ACK is sufficient to proceed. On NAK the 2-byte reject_reason
+/// (BIND_NAK body offset 0) is captured into `RpcError::Protocol` so callers can see
+/// exactly which reject the server sent — spec-decodable reasons (RFC 3.3.1 table):
+///   0: reason_not_specified · 1: temporary_congestion · 2: local_limit_exceeded
+///   3: called_paddr_unknown · 4: protocol_version_not_supported
+///   5: default_context_not_supported · 6: user_data_not_readable
+///   7: no_psap_available · 8: authentication_type_not_recognized
+///   9: invalid_checksum
 pub fn expect_bind_ack(buf: &[u8]) -> Result<()> {
     let h = parse_header(buf)?;
     match h.ptype {
         ptype::BIND_ACK => Ok(()),
-        ptype::BIND_NAK => Err(RpcError::BindRejected),
+        ptype::BIND_NAK => {
+            let reason = buf
+                .get(16..18)
+                .map(|b| u16::from_le_bytes(b.try_into().unwrap()));
+            Err(RpcError::Protocol(match reason {
+                Some(r) => format!("BIND_NAK reject_reason={r}"),
+                None => "BIND_NAK (no reason field)".to_string(),
+            }))
+        }
         other => Err(RpcError::UnexpectedPdu(other)),
     }
 }
